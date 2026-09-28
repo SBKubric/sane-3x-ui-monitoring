@@ -510,6 +510,46 @@ func (e *Engine) MonClientRevoked(ctx context.Context, tx *gorm.DB, mc store.Mon
 	return func(ctx context.Context) { e.flush(ctx, &notify) }, nil
 }
 
+// Resync answers the panel's resync request (decision SBKubric/sane-3x-ui#151
+// Q3, CONTEXT.md: State resync): for each named target it files an ordinary
+// target event with from = to = the target's current state, reason resync
+// and notified = true — the panel applies it silently, and there is no
+// transition for Telegram to announce. A target mon-server does not know,
+// or holds in UNKNOWN itself, gets nothing: there is no state to confirm.
+//
+// The event's ts is mon-server's time now, not the target's since. The
+// panel keeps its rule that an event older than the target's since does
+// not move it (contract §4.6), and a target it re-created from statistics
+// has a since newer than the state mon-server has held all along — the
+// very case resync exists for — so a ts of the old since would be ignored.
+//
+// Resync is Resyncer for Buckets; it does not throttle — that is the
+// caller's per-stats-cycle concern.
+func (e *Engine) Resync(ctx context.Context, refs []panel.TargetRef) error {
+	nowMs := clock.Ms(e.clk.Now())
+	return e.st.DB.Transaction(func(tx *gorm.DB) error {
+		tx = tx.WithContext(ctx)
+		for _, ref := range refs {
+			var t store.Target
+			err := tx.Where("mon_client_id = ? AND inbound_kind = ? AND inbound_id = ? AND path = ?",
+				ref.MonClientId, ref.InboundKind, ref.InboundId, ref.Path).Take(&t).Error
+			switch {
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				continue
+			case err != nil:
+				return fmt.Errorf("state: read target to resync: %w", err)
+			}
+			if t.State == store.TargetUnknown {
+				continue
+			}
+			if _, err := e.enqueueTarget(tx, t, t.State, t.State, ReasonResync, nowMs, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // ---------------------------------------------------------------------
 // heartbeat internals
 // ---------------------------------------------------------------------

@@ -286,8 +286,25 @@ type EventsResult struct {
 // Duplicates counter because stats are upserted by key, so a resend
 // overwrites rather than collides. Rejected and the empty-body rule are the
 // same as EventsResult's.
+//
+// Resync is the panel asking for a state resync (CONTEXT.md: State resync,
+// decision SBKubric/sane-3x-ui#151): the targets it holds no state for —
+// in UNKNOWN and without a single event since the panel created them. It is
+// an optional field (contract §1), absent from an older panel's answer and
+// allowed to be omitted when empty, so nil means "nothing asked".
 type StatsResult struct {
-	Accepted int        `json:"accepted"`
-	Ignored  []Ignored  `json:"ignored"`
-	Rejected []Rejected `json:"rejected"`
+	Accepted int         `json:"accepted"`
+	Ignored  []Ignored   `json:"ignored"`
+	Rejected []Rejected  `json:"rejected"`
+	Resync   []TargetRef `json:"resync,omitempty"`
+}
+
+// TargetRef names one target the way the panel keys it, with the same
+// field names as a POST /stats element (contract §4.7): the form of
+// StatsResult.Resync.
+type TargetRef struct {
+	MonClientId string `json:"monClientId"`
+	InboundKind string `json:"inboundKind"`
+	InboundId   int    `json:"inboundId"`
+	Path        string `json:"path"`
 }
