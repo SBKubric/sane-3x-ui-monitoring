@@ -252,6 +252,10 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 	poller.SetInbounds(engine)
 	poller.SetPathSync(engine)
 	poller.SetStats(buckets)
+	// The panel asks for a state resync in its POST /stats answer (decision
+	// SBKubric/sane-3x-ui#151); the buckets read the answer, the engine
+	// files the events.
+	buckets.SetResyncer(engine)
 	reg.SetHooks(registry.Hooks{
 		PathsChanged: configs.Rebuild,
 		Approved:     configs.Rebuild,

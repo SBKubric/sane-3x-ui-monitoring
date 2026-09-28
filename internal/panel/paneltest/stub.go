@@ -180,6 +180,7 @@ type Stub struct {
 	rejectedEvents []panel.Rejected
 	rejectedStats  []panel.Rejected
 	legacy         bool
+	resync         []panel.TargetRef
 
 	failN      int
 	failStatus int
@@ -448,6 +449,16 @@ func (s *Stub) SetLegacyAnswers(on bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.legacy = on
+}
+
+// SetResync makes every later POST /stats answer ask for a state resync of
+// these targets (StatsResult.Resync), the way a panel names the targets it
+// holds no state for in each answer until an event arrives. nil stops
+// asking; legacy mode never asks, since a bare 200 carries no fields.
+func (s *Stub) SetResync(refs []panel.TargetRef) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resync = append([]panel.TargetRef(nil), refs...)
 }
 
 // RejectedEvents returns every rejection POST /events answered with, in
@@ -940,6 +951,7 @@ func (s *Stub) handleStats(w http.ResponseWriter, body []byte) {
 		s.stats[key] = st
 		res.Accepted++
 	}
+	res.Resync = append([]panel.TargetRef(nil), s.resync...)
 
 	s.writeBatchResult(w, res)
 }

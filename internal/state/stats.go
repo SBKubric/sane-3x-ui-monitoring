@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -44,10 +45,39 @@ const (
 // state of its own beyond its collaborators — everything it knows lives in
 // `stats_buckets` — so a restart mid-window loses nothing and a bucket
 // keeps accumulating exactly where it left off.
+//
+// The POST /stats answer is also where the panel asks for a state resync
+// (StatsResult.Resync); Flush hands the named targets to the Resyncer, if
+// one is set.
 type Buckets struct {
 	st  *store.Store
 	clk clock.Clock
+
+	resyncer Resyncer
+
+	// resyncMu guards the resync throttle (decision #151 Q5: at most one
+	// resync per target per stats cycle). It lives in memory only — after a
+	// restart a target may be resynced once more, which costs the panel one
+	// silent update. resyncCycle is the stats cycle resynced holds keys
+	// for; entering a new one starts the set over, so it never grows past
+	// one cycle's worth.
+	resyncMu    sync.Mutex
+	resyncCycle int64
+	resynced    map[panel.TargetRef]bool
 }
+
+// Resyncer answers the panel's resync request (decision
+// SBKubric/sane-3x-ui#151 Q3): it files a state resync event for each named
+// target mon-server holds a state for. The Engine implements it; it is an
+// interface here only because the Engine takes Buckets as a dependency and
+// is built after them.
+type Resyncer interface {
+	Resync(ctx context.Context, refs []panel.TargetRef) error
+}
+
+// SetResyncer sets who answers the panel's resync requests. Without one
+// they are ignored, which is also what an older mon-server did.
+func (b *Buckets) SetResyncer(r Resyncer) { b.resyncer = r }
 
 // NewBuckets wires the aggregate to the database it lives in and the clock
 // that decides when a bucket has closed. The clock is injected for the same
@@ -238,7 +268,50 @@ func (b *Buckets) Flush(ctx context.Context, c panel.Client) error {
 		if err := b.markDropped(ctx, refused); err != nil {
 			return err
 		}
+		b.resync(ctx, res.Resync)
 	}
+}
+
+// resync passes the panel's resync request on, minus the targets already
+// resynced in this stats cycle: the panel names a target in every answer
+// until an event arrives, and one flush may post several batches, or post
+// again when a late heartbeat reopens a sent bucket. A failure is logged,
+// not returned: the stats themselves went in, and the panel names the same
+// targets again in the next cycle's answer.
+func (b *Buckets) resync(ctx context.Context, refs []panel.TargetRef) {
+	if b.resyncer == nil || len(refs) == 0 {
+		return
+	}
+	fresh := b.throttleResync(refs)
+	if len(fresh) == 0 {
+		return
+	}
+	if err := b.resyncer.Resync(ctx, fresh); err != nil {
+		slog.Warn("state: answering the panel's resync request", "err", err, "count", len(fresh))
+	}
+}
+
+// throttleResync returns the refs not yet resynced in the current stats
+// cycle and marks them resynced. The stats cycle is the 5-minute window
+// whose close the flush is reporting (spec §7.4): every flush between one
+// window's close and the next's falls in the same one.
+func (b *Buckets) throttleResync(refs []panel.TargetRef) []panel.TargetRef {
+	cycle := (clock.Ms(b.clk.Now()) - bucketCloseDelayMs) / bucketWindowMs
+	b.resyncMu.Lock()
+	defer b.resyncMu.Unlock()
+	if b.resynced == nil || cycle != b.resyncCycle {
+		b.resyncCycle = cycle
+		b.resynced = map[panel.TargetRef]bool{}
+	}
+	var fresh []panel.TargetRef
+	for _, r := range refs {
+		if b.resynced[r] {
+			continue
+		}
+		b.resynced[r] = true
+		fresh = append(fresh, r)
+	}
+	return fresh
 }
 
 // markSent stamps sent_at on the rows one POST /stats accepted, which is

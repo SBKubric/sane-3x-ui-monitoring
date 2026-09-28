@@ -92,6 +92,10 @@ _Avoid_: version, generation, panel revision
 Цикл проб mon-client, за который heartbeat так и не был подтверждён mon-server; его провалы не считаются, потому что адресат tunnel probe — сам mon-server, и его недоступность нельзя отличить от падения туннеля.
 _Avoid_: offline cycle, buffered cycle
 
+**State resync** (сверка состояния):
+Событие, которым mon-server подтверждает панели текущее состояние target'а без перехода (`from = to`, `reason: resync`), когда панель в ответе на статистику называет target'ы, по которым у неё нет состояния; панель применяет его молча.
+_Avoid_: state sync, replay, full sync
+
 **Admin UI**:
 Веб-интерфейс mon-server за логином и паролем: одобрение registration requests, реестр mon-clients и все настройки mon-server; состояние targets он не показывает — это страница Monitoring панели.
 _Avoid_: dashboard, console, mon-server panel

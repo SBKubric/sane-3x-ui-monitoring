@@ -137,6 +137,12 @@ const (
 	// parse, or the AWG device refused it (decision #53 п. 3). The
 	// mon-client says so in client.rejectedTargets, not the builder.
 	ReasonConfigError = "config_error"
+
+	// ReasonResync marks a state resync (CONTEXT.md: State resync, decision
+	// SBKubric/sane-3x-ui#151): not a transition but mon-server confirming a
+	// target's current state, from = to, because the panel said it holds
+	// none for it.
+	ReasonResync = "resync"
 )
 
 // configPauseReasons are the PAUSED reasons a heartbeat owns: it sets them
