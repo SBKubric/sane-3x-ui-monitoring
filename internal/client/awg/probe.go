@@ -26,8 +26,8 @@ const handshakePollInterval = 50 * time.Millisecond
 // maxDetail is the cap on Result.Detail (spec §5: detail ≤ 256 characters),
 // the same number as internal/client/probe.MaxDetail — kept as its own
 // constant because failure (below) truncates AWG's own manually-composed
-// details (the logger-ring text) before any of internal/client/probe's code
-// ever sees them.
+// details (the handshake attempts, amneziawg-go's error) before any of
+// internal/client/probe's code ever sees them.
 const maxDetail = 256
 
 // Prober probes AWG targets and logs one line per result (spec §7).
@@ -64,9 +64,11 @@ func Probe(ctx context.Context, probeURL, token string, key proto.TargetKey, cfg
 //
 //	fresh device → dial mon-server through the tunnel (connectMs measured
 //	by hand, since httptrace cannot see a gVisor dialer) → handshakeMs from
-//	the UAPI last_handshake_time polled every 50 ms → the shared HTTP half
-//	(internal/client/probe.Do) hands over that same connection for tlsMs,
-//	ttfbMs and the nonce echo → 200 with the same nonce is a success.
+//	the UAPI last_handshake_time polled every 50 ms until the end of the
+//	budget → the connect, given connectMs from the handshake → the shared
+//	HTTP half (internal/client/probe.Do) hands over that same connection
+//	for tlsMs, ttfbMs and the nonce echo, in what is left of the budget →
+//	200 with the same nonce is a success.
 //
 // The device is always closed before returning, including on every failure
 // path: a leaked device keeps a UDP socket and a gVisor stack alive for the
@@ -119,8 +121,13 @@ func (p Prober) probe(ctx context.Context, probeURL, token string, key proto.Tar
 	// t0 is taken before the first dial because that dial is what makes
 	// netstack push a packet into the device, which is what queues the
 	// handshake initiation (research §6.2).
+	//
+	// The dial lives as long as the probe's budget (#102): the SYN it sends
+	// waits, staged inside amneziawg-go, for as long as the handshake takes,
+	// and goes out the moment the handshake lands. Its connect phase proper
+	// is bounded separately below, from the handshake on.
 	t0 := time.Now()
-	dialCtx, cancelDial := context.WithTimeout(ctx, b.Connect)
+	dialCtx, cancelDial := context.WithCancel(ctx)
 	defer cancelDial()
 
 	type dialResult struct {
@@ -135,18 +142,40 @@ func (p Prober) probe(ctx context.Context, probeURL, token string, key proto.Tar
 		dialed <- dialResult{conn: c, err: err, took: time.Since(start)}
 	}()
 
-	hs, gotHandshake := pollHandshake(ctx, dev, t0.Add(b.Connect))
+	// The handshake is waited for until the end of the probe's budget, not
+	// for connectMs (#102): WireGuard retries an unanswered initiation only
+	// every ~5 s, so a connectMs-long wait turned a single lost UDP packet
+	// into a failed probe. Any handshake inside the budget counts.
+	hs, gotHandshake := pollHandshake(ctx, dev)
 	if gotHandshake {
 		handshakeMs = msPtr(hs.Sub(t0))
 	}
 
-	// The dial is waited out rather than cancelled here: it is already
-	// bounded by dialCtx (b.Connect), and the handshake landing is not the
-	// end of the connect — the SYN goes out through the tunnel only once
-	// the handshake is done, so cancelling the moment pollHandshake
-	// returns would abort a connect that had not had a single round trip
-	// to succeed in, and report its abort as a tcp failure.
-	d := <-dialed
+	// Once the handshake has landed, the SYN rides the tunnel and the
+	// connect phase begins: it gets connectMs from here (still inside the
+	// budget), and a connect that does not finish in it is tcp_timeout.
+	// The dial is waited out rather than cancelled the moment the
+	// handshake lands, because the handshake is not the end of the
+	// connect — cancelling it then would abort a connect that had not had
+	// a single round trip to succeed in and report its abort as a tcp
+	// failure. Without a handshake the budget is already spent, and the
+	// dial (bound to it through dialCtx) is only collected.
+	var d dialResult
+	connectTimedOut := false
+	if gotHandshake {
+		timer := time.NewTimer(b.Connect)
+		select {
+		case d = <-dialed:
+		case <-timer.C:
+			connectTimedOut = true
+			cancelDial()
+			d = <-dialed
+		}
+		timer.Stop()
+	} else {
+		cancelDial()
+		d = <-dialed
+	}
 	// The handed-over connection is closed exactly once, however many
 	// owners it ends up with: this defer always runs, and http.Transport
 	// closes the connection it was handed too (DisableKeepAlives). Without
@@ -161,11 +190,12 @@ func (p Prober) probe(ctx context.Context, probeURL, token string, key proto.Tar
 	connectMs := msPtr(d.took)
 
 	if !gotHandshake {
-		detail := dev.HandshakeFailures()
-		if detail == "" {
-			detail = fmt.Sprintf("last_handshake_time=0 after %dms", b.Connect.Milliseconds())
-		}
+		detail := fmt.Sprintf("last_handshake_time=0 after %dms, %s", time.Since(t0).Milliseconds(), dev.HandshakeAttempts())
 		return failure(key, probe.Phases{ConnectMs: connectMs}, handshakeMs, proto.ReasonAWGNoHandshake, detail)
+	}
+	if connectTimedOut && d.conn == nil {
+		detail := fmt.Sprintf("connect through the tunnel did not finish %dms after the handshake", b.Connect.Milliseconds())
+		return failure(key, probe.Phases{}, handshakeMs, proto.ReasonTCPTimeout, detail)
 	}
 	if d.err != nil {
 		// The dial's own failure is classified the same way the shared
@@ -208,29 +238,21 @@ func (p Prober) probe(ctx context.Context, probeURL, token string, key proto.Tar
 }
 
 // pollHandshake waits for the peer's first handshake, reading the UAPI dump
-// every handshakePollInterval until it appears, the deadline passes or the
-// probe's budget runs out (spec §5).
-func pollHandshake(ctx context.Context, dev *Device, deadline time.Time) (time.Time, bool) {
+// every handshakePollInterval until it appears or the probe's budget (ctx)
+// runs out (spec §5, #102).
+func pollHandshake(ctx context.Context, dev *Device) (time.Time, bool) {
+	ticker := time.NewTicker(handshakePollInterval)
+	defer ticker.Stop()
 	for {
 		if t, ok := dev.LastHandshake(); ok {
 			return t, true
 		}
-		wait := time.Until(deadline)
-		if wait <= 0 {
-			return time.Time{}, false
-		}
-		if wait > handshakePollInterval {
-			wait = handshakePollInterval
-		}
-		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			// One last look: the handshake may have landed while
 			// the budget was expiring.
-			t, ok := dev.LastHandshake()
-			return t, ok
-		case <-timer.C:
+			return dev.LastHandshake()
+		case <-ticker.C:
 		}
 	}
 }

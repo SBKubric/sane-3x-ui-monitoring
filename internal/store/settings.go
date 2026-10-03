@@ -1,8 +1,10 @@
 package store
 
 import (
+	"fmt"
 	"strconv"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -70,7 +72,7 @@ func DefaultSettings() *Settings {
 		PanelDownAfter:     3,
 
 		IntervalMs:         60000,
-		BudgetMs:           20000,
+		BudgetMs:           30000,
 		ConnectMs:          5000,
 		TlsMs:              10000,
 		HeadersMs:          10000,
@@ -155,6 +157,43 @@ func (s *Store) SaveSettings(set *Settings) error {
 		Columns:   []clause.Column{{Name: "key"}},
 		DoUpdates: clause.AssignmentColumns([]string{"value"}),
 	}).Create(&rows).Error
+}
+
+// Old and new default of budgetMs (#102), and the settings row that records
+// that migrateBudgetDefault has run. The marker is a settings key no
+// Settings field reads, so LoadSettings ignores it and SaveSettings, which
+// deletes nothing, keeps it.
+const (
+	oldDefaultBudgetMs           = "20000"
+	settingBudgetDefaultMigrated = "migratedBudgetMs30000"
+)
+
+// migrateBudgetDefault carries an install onto the 30 s probe budget of
+// #102. Save writes every setting (spec §9.4, and the orchestrator posts
+// the whole form back), so nearly every running mon-server has the old
+// 20 s default stored as budgetMs and would never see the new default. A
+// stored "20000" is taken for that old default and rewritten to the new
+// one; any other value was chosen by an administrator and is kept. It runs
+// once — the marker row is written in the same transaction — so a 20 s
+// budget an administrator sets on purpose afterwards survives restarts.
+// The documents pick the new budget up on the first panel poll after the
+// restart, which rebuilds them all.
+func (s *Store) migrateBudgetDefault() error {
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		var marker int64
+		if err := tx.Model(&Setting{}).Where("key = ?", settingBudgetDefaultMigrated).Count(&marker).Error; err != nil {
+			return fmt.Errorf("store: read budget migration marker: %w", err)
+		}
+		if marker > 0 {
+			return nil
+		}
+		newBudget := strconv.FormatInt(DefaultSettings().BudgetMs, 10)
+		if err := tx.Model(&Setting{}).Where("key = ? AND value = ?", settingBudgetMs, oldDefaultBudgetMs).
+			Update("value", newBudget).Error; err != nil {
+			return fmt.Errorf("store: migrate budgetMs default: %w", err)
+		}
+		return tx.Create(&Setting{Key: settingBudgetDefaultMigrated, Value: "1"}).Error
+	})
 }
 
 // strOr returns kv[key] if present, else fall back.

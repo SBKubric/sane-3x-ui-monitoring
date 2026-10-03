@@ -24,22 +24,23 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/config"
 )
 
-// handshakeFailureMark is the substring amneziawg-go logs when an
-// initiation goes unanswered ("Handshake did not complete after 5 seconds,
-// retrying (try 2)", research §3.5). WireGuard has no handshake *error* —
-// an unauthorised or unreachable peer simply never replies — so these lines
-// are the only human-readable evidence a failed probe can carry as its
-// `detail` (spec §5, reason awg_no_handshake).
-const handshakeFailureMark = "Handshake did not complete"
+// initiationMark is the substring amneziawg-go logs every time it sends a
+// handshake initiation ("peer(…) - Sending handshake initiation"), the
+// first one and every retry ~5 s later alike. WireGuard has no handshake
+// *error* — an unauthorised or unreachable peer simply never replies — so
+// how many initiations went unanswered is the most a failed probe can say
+// in its `detail` (spec §5, reason awg_no_handshake; #102).
+const initiationMark = "Sending handshake initiation"
 
-// logRingSize is how many handshake-failure lines one probe keeps. A probe
-// lasts a few seconds and amneziawg-go retries every 5 s (research §3.5),
-// so a handful is already more than one probe can produce; the ring only
-// exists so a pathological device cannot grow memory without bound.
-const logRingSize = 8
+// initiationErrorMark is the substring of amneziawg-go's error lines about
+// an initiation it could not build or send ("Failed to send handshake
+// initiation: <err>", "Failed to create initiation message: <err>"): the
+// one case where the device knows why there was no handshake, e.g. the
+// host has no route to the endpoint.
+const initiationErrorMark = "initiation"
 
 // Device is one live netstack AWG tunnel: the gVisor stack, the
-// amneziawg-go device driving it, and the handshake-failure lines the
+// amneziawg-go device driving it, and the record of handshake attempts the
 // device logged while it was up.
 //
 // It is deliberately single-use. Keeping a device alive across probes would
@@ -48,9 +49,9 @@ const logRingSize = 8
 // single initiation plus Jc junk packets a minute and buys a handshake
 // measurement every cycle (research §3.6, spec §5).
 type Device struct {
-	dev  *device.Device
-	tun  *netTUN
-	ring *logRing
+	dev *device.Device
+	tun *netTUN
+	hs  *handshakeLog
 }
 
 // Open brings up a fresh netstack device for cfg: a netTUN with the
@@ -67,12 +68,12 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("awg: no config")
 	}
-	ring := &logRing{}
+	hs := &handshakeLog{}
 	tun, err := newNetTUN(cfg.LocalAddresses, cfg.MTU)
 	if err != nil {
 		return nil, fmt.Errorf("awg: create netstack tun: %w", err)
 	}
-	dev := newDevice(tun, ring.logger())
+	dev := newDevice(tun, hs.logger())
 	if err := dev.IpcSet(cfg.UAPI); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("awg: apply uapi config: %w", err)
@@ -81,7 +82,7 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 		dev.Close()
 		return nil, fmt.Errorf("awg: bring device up: %w", err)
 	}
-	return &Device{dev: dev, tun: tun, ring: ring}, nil
+	return &Device{dev: dev, tun: tun, hs: hs}, nil
 }
 
 // newDevice is the one way this package builds an amneziawg-go device, so
@@ -116,10 +117,12 @@ func (d *Device) LastHandshake() (t time.Time, ok bool) {
 	return parseLastHandshake(dump)
 }
 
-// HandshakeFailures returns the handshake-failure lines the device logged,
-// newest last, joined for use as a Result.Detail (spec §5).
-func (d *Device) HandshakeFailures() string {
-	return strings.Join(d.ring.lines(), "; ")
+// HandshakeAttempts describes the handshake attempts the device made, for
+// use in an awg_no_handshake Result.Detail (spec §5): how many initiations
+// it sent and, when one could not be sent at all, amneziawg-go's last error
+// about it.
+func (d *Device) HandshakeAttempts() string {
+	return d.hs.String()
 }
 
 // Close tears the device and its netstack down. It is safe to call twice,
@@ -169,49 +172,52 @@ func parseLastHandshake(dump string) (time.Time, bool) {
 	return best, ok
 }
 
-// logRing is the device.Logger adapter: it keeps the last few
-// handshake-failure lines and throws the rest of amneziawg-go's very
-// chatty verbose output away. mon-client's own log is slog on stdout
-// (spec §7); the device's log exists only to give a failed probe a
-// `detail`.
-type logRing struct {
-	mu   sync.Mutex
-	buf  [logRingSize]string
-	n    int
-	next int
+// handshakeLog is the device.Logger adapter: it counts the handshake
+// initiations the device sent, keeps the last error about one, and throws
+// the rest of amneziawg-go's very chatty verbose output away. mon-client's
+// own log is slog on stdout (spec §7); the device's log exists only to give
+// a failed probe a `detail`.
+type handshakeLog struct {
+	mu          sync.Mutex
+	initiations int
+	lastErr     string
 }
 
-// logger hands amneziawg-go a Logger whose two levels both funnel into the
-// ring. Both are set (rather than only Errorf) because "Handshake did not
-// complete" is a *verbose* line in amneziawg-go, not an error one.
-func (r *logRing) logger() *device.Logger {
-	record := func(format string, args ...any) {
-		line := fmt.Sprintf(format, args...)
-		if strings.Contains(line, handshakeFailureMark) {
-			r.append(line)
-		}
+// logger hands amneziawg-go a Logger for both levels. "Sending handshake
+// initiation" is a *verbose* line in amneziawg-go, the send failures are
+// error lines.
+func (h *handshakeLog) logger() *device.Logger {
+	return &device.Logger{
+		Verbosef: func(format string, args ...any) {
+			if strings.Contains(format, initiationMark) {
+				h.mu.Lock()
+				h.initiations++
+				h.mu.Unlock()
+			}
+		},
+		Errorf: func(format string, args ...any) {
+			line := fmt.Sprintf(format, args...)
+			if strings.Contains(line, initiationErrorMark) {
+				h.mu.Lock()
+				h.lastErr = line
+				h.mu.Unlock()
+			}
+		},
 	}
-	return &device.Logger{Verbosef: record, Errorf: record}
 }
 
-func (r *logRing) append(line string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.buf[r.next] = line
-	r.next = (r.next + 1) % logRingSize
-	if r.n < logRingSize {
-		r.n++
+// String is the attempts part of a detail: "3 handshake attempts", plus
+// "; <last error>" when an initiation could not be sent.
+func (h *handshakeLog) String() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	noun := "attempts"
+	if h.initiations == 1 {
+		noun = "attempt"
 	}
-}
-
-// lines returns the recorded lines oldest first.
-func (r *logRing) lines() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]string, 0, r.n)
-	start := (r.next - r.n + logRingSize) % logRingSize
-	for i := 0; i < r.n; i++ {
-		out = append(out, r.buf[(start+i)%logRingSize])
+	out := fmt.Sprintf("%d handshake %s", h.initiations, noun)
+	if h.lastErr != "" {
+		out += "; " + h.lastErr
 	}
 	return out
 }

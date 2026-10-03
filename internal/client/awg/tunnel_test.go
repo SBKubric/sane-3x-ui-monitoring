@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -133,6 +134,118 @@ func TestProbeThroughTunnelWrongNonce(t *testing.T) {
 	if res.HandshakeMs == nil || res.TlsMs == nil {
 		t.Error("a failure after TLS must still carry the phases it did measure")
 	}
+}
+
+// TestProbeWaitsForALateHandshake is #102: in production a standby edge
+// lost the AWG server's handshake response on its way back, amneziawg-go
+// sent the next initiation ~5 s later and that one went through — but the
+// probe had already given up at connectMs (5 s) and reported
+// awg_no_handshake. A lossy relay between the two ends drops the far end's
+// first two responses, so the handshake only completes on the third
+// initiation, ~10 s in: twice connectMs, well inside the 30 s budget. The
+// probe must wait for it and succeed.
+func TestProbeWaitsForALateHandshake(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for two WireGuard handshake retries (~10 s)")
+	}
+	far := startFarEnd(t, http.HandlerFunc(probeEcho))
+	relay := startLossyRelay(t, far.port, 2)
+	clientCfg := far.clientConf(t, fmt.Sprintf("127.0.0.1:%d", relay.port))
+
+	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: far.pool}}
+	b := probe.Budgets{Budget: 30 * time.Second, Connect: 5 * time.Second, TLS: 10 * time.Second, Headers: 10 * time.Second}
+	res := p.Probe(context.Background(), far.probeURL(), "tok",
+		proto.TargetKey{InboundKind: "awg", InboundID: 7, Path: "edge:proxy2"}, clientCfg, b)
+
+	if !res.Ok {
+		t.Fatalf("probe failed: reason=%q detail=%q (dropped %d responses)", deref(res.Reason), deref(res.Detail), relay.dropped())
+	}
+	if relay.dropped() != 2 {
+		t.Fatalf("relay dropped %d responses, want 2", relay.dropped())
+	}
+	if res.HandshakeMs == nil || *res.HandshakeMs <= b.Connect.Milliseconds() {
+		t.Errorf("handshakeMs = %s, want past connectMs (%dms): the handshake came on a retry", msString(res.HandshakeMs), b.Connect.Milliseconds())
+	}
+	if res.TlsMs == nil || res.TtfbMs == nil {
+		t.Error("the HTTP half after a late handshake must still be measured")
+	}
+}
+
+// lossyRelay is a UDP relay between the near end and the far end that
+// drops the first few datagrams coming back from the far end — the AWG
+// handshake responses, since nothing else travels that way before a
+// handshake — the way the return path from a standby edge did (#102).
+type lossyRelay struct {
+	port int // the relay's UDP port on 127.0.0.1, the near end's Endpoint
+
+	mu       sync.Mutex
+	toDrop   int
+	nDropped int
+}
+
+func (r *lossyRelay) dropped() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nDropped
+}
+
+// startLossyRelay relays between a near end that will send to the
+// returned port and the far end on farPort, dropping the far end's first
+// drop datagrams.
+func startLossyRelay(t *testing.T, farPort, drop int) *lossyRelay {
+	t.Helper()
+	near, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	t.Cleanup(func() { _ = near.Close() })
+	farConn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: farPort})
+	if err != nil {
+		t.Fatalf("relay dial far end: %v", err)
+	}
+	t.Cleanup(func() { _ = farConn.Close() })
+
+	r := &lossyRelay{port: near.LocalAddr().(*net.UDPAddr).Port, toDrop: drop}
+	var (
+		peerMu sync.Mutex
+		peer   *net.UDPAddr
+	)
+	go func() { // near end → far end
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := near.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			peerMu.Lock()
+			peer = from
+			peerMu.Unlock()
+			_, _ = farConn.Write(buf[:n])
+		}
+	}()
+	go func() { // far end → near end, minus the first few
+		buf := make([]byte, 65535)
+		for {
+			n, err := farConn.Read(buf)
+			if err != nil {
+				return
+			}
+			r.mu.Lock()
+			drop := r.nDropped < r.toDrop
+			if drop {
+				r.nDropped++
+			}
+			r.mu.Unlock()
+			peerMu.Lock()
+			to := peer
+			peerMu.Unlock()
+			if drop || to == nil {
+				continue
+			}
+			_, _ = near.WriteToUDP(buf[:n], to)
+		}
+	}()
+	return r
 }
 
 // farEnd is the stand-in AWG server of the tunnel tests: a netstack device
