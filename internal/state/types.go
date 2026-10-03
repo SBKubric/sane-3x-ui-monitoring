@@ -56,11 +56,40 @@ type RejectedTarget struct {
 // failures therefore say nothing (the probe's target is mon-server itself,
 // so "mon-server was unreachable" and "the tunnel is down" look identical —
 // protocol §5.3).
+//
+// Sweep is the diagnostic sweep run the mon-client made in this cycle,
+// because the heartbeat answer before it asked for one (decision #100,
+// protocol §5.3); nil in every other cycle.
 type Cycle struct {
-	Seq        int64    `json:"seq"`
-	Ts         int64    `json:"ts"`
-	Unverified bool     `json:"unverified"`
-	Results    []Result `json:"results"`
+	Seq        int64       `json:"seq"`
+	Ts         int64       `json:"ts"`
+	Unverified bool        `json:"unverified"`
+	Results    []Result    `json:"results"`
+	Sweep      *CycleSweep `json:"sweep,omitempty"`
+}
+
+// CycleSweep is one diagnostic sweep run as a cycle reports it (protocol
+// §5.3): the inbound kinds it was asked for, the tunnel probes of their
+// sweep targets (the document's sweepTargets) and the host reachability
+// checks of the hosts it was given.
+type CycleSweep struct {
+	Kinds   []string    `json:"kinds"`
+	Results []Result    `json:"results"`
+	Hosts   []HostCheck `json:"hosts"`
+}
+
+// HostCheck is one host reachability check the mon-client made (protocol
+// §5.3, CONTEXT.md: Host reachability check): a series of ICMP echoes to
+// the host named Name in the sweep job. Reason is set when the series
+// could not be run at all — icmp_unavailable (no ICMP socket on the box),
+// resolve_failed (the name did not resolve) — and then nothing was
+// measured, which is not the same as 100% loss.
+type HostCheck struct {
+	Name     string  `json:"name"`
+	Sent     int     `json:"sent"`
+	LossPct  int     `json:"lossPct"`
+	RttAvgMs *int64  `json:"rttAvgMs"`
+	Reason   *string `json:"reason"`
 }
 
 // Result is one target's probe outcome inside a cycle (protocol §5.3).
@@ -85,10 +114,28 @@ type Result struct {
 // mon-client should converge on, mon-server's receive time, and the highest
 // cycle seq mon-server has now taken responsibility for — everything at or
 // below AckSeq may be dropped from the mon-client's resend buffer.
+//
+// Sweep asks for a diagnostic sweep run in the mon-client's next cycle
+// (decision #100, protocol §5.3); absent when none is due.
 type HeartbeatResponse struct {
-	ConfigRevision string `json:"configRevision"`
-	ServerTs       int64  `json:"serverTs"`
-	AckSeq         int64  `json:"ackSeq"`
+	ConfigRevision string    `json:"configRevision"`
+	ServerTs       int64     `json:"serverTs"`
+	AckSeq         int64     `json:"ackSeq"`
+	Sweep          *SweepJob `json:"sweep,omitempty"`
+}
+
+// SweepJob is one diagnostic sweep run handed to a mon-client: the inbound
+// kinds whose sweep targets it probes, and the hosts it checks with ICMP —
+// Name "" is the real server.
+type SweepJob struct {
+	Kinds []string       `json:"kinds"`
+	Hosts []SweepJobHost `json:"hosts"`
+}
+
+// SweepJobHost is one host of a SweepJob.
+type SweepJobHost struct {
+	Name string `json:"name"`
+	Host string `json:"host"`
 }
 
 // Reason dictionary (spec §7.2). Every event this package enqueues carries
@@ -148,6 +195,11 @@ const (
 	// (CONTEXT.md: Derived state, decision #100): UP because an edge-path
 	// of the same inbound kind is UP. Always notified, never Telegram.
 	ReasonDerived = "derived"
+
+	// ReasonSweep marks a move of a held target (direct, inner:*) by a
+	// diagnostic sweep's tunnel probe (decision #100). Always notified,
+	// never Telegram: the sweep's own summary is the message.
+	ReasonSweep = "sweep"
 )
 
 // configPauseReasons are the PAUSED reasons a heartbeat owns: it sets them
@@ -168,4 +220,5 @@ var configPauseReasons = map[string]bool{
 const (
 	eventKindTarget    = "target"
 	eventKindMonClient = "mon_client"
+	eventKindSweep     = "sweep"
 )

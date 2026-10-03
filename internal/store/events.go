@@ -16,7 +16,7 @@ import (
 type EventPayload struct {
 	ID   string `json:"id"`
 	Ts   int64  `json:"ts"`
-	Kind string `json:"kind"` // "target" | "mon_client" | "panel"
+	Kind string `json:"kind"` // "target" | "mon_client" | "panel" | "sweep"
 
 	MonClientID string `json:"monClientId,omitempty"`
 	InboundKind string `json:"inboundKind,omitempty"`
@@ -31,6 +31,12 @@ type EventPayload struct {
 	// out (via the panel normally, or directly from mon-server in
 	// PANEL_DOWN, spec §4.1) — the panel must not send a second one.
 	Notified bool `json:"notified"`
+
+	// Phase and Report belong to kind "sweep" only (decision #100, contract
+	// §4.6): which moment of a diagnostic sweep this is — start, change or
+	// end — and what the sweep found. Both are absent from every other kind.
+	Phase  string       `json:"phase,omitempty"`
+	Report *SweepReport `json:"report,omitempty"`
 }
 
 // EnqueueEvent durably queues one event for the panel (spec §4 step 4) by

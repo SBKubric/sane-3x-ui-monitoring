@@ -962,3 +962,98 @@ func TestLoop_ServerAheadIsCaughtUpByTheAck(t *testing.T) {
 		t.Fatalf("second heartbeat's cycles = %+v, want one with seq 1441", got)
 	}
 }
+
+// sweepingApplier is a fakeApplier that also keeps sweep probes (Sweeper).
+type sweepingApplier struct {
+	*fakeApplier
+	sweep map[proto.TargetKey]probe.Fn
+}
+
+func (a *sweepingApplier) SweepProbes(kinds []string) map[proto.TargetKey]probe.Fn {
+	out := map[proto.TargetKey]probe.Fn{}
+	for k, fn := range a.sweep {
+		for _, kind := range kinds {
+			if k.InboundKind == kind {
+				out[k] = fn
+			}
+		}
+	}
+	return out
+}
+
+// fakeHosts answers every host reachability check with a fixed loss.
+type fakeHosts struct {
+	mu    sync.Mutex
+	calls [][]proto.SweepJobHost
+}
+
+func (f *fakeHosts) Check(_ context.Context, hosts []proto.SweepJobHost) []proto.HostCheck {
+	f.mu.Lock()
+	f.calls = append(f.calls, hosts)
+	f.mu.Unlock()
+	out := make([]proto.HostCheck, 0, len(hosts))
+	for _, h := range hosts {
+		rtt := int64(7)
+		out = append(out, proto.HostCheck{Name: h.Name, Sent: 10, LossPct: 10, RttAvgMs: &rtt})
+	}
+	return out
+}
+
+// TestLoop_SweepRunsInTheNextCycleOnly is decision #100's mon-client side:
+// a heartbeat answer that asks for a diagnostic sweep makes the next cycle
+// probe the sweep targets of the named kinds — not of the others — and run
+// the host reachability checks, reporting both in the cycle's sweep block
+// (not among its results); the cycle after that is an ordinary one again.
+func TestLoop_SweepRunsInTheNextCycleOnly(t *testing.T) {
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): okProbe})
+	d := doc("rev1")
+	h.stub.SetConfig(d)
+	h.stub.SetRevision("rev1")
+	direct := proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "direct"}
+	awgDirect := proto.TargetKey{InboundKind: "awg", InboundID: 0, Path: "direct"}
+	applier := &sweepingApplier{fakeApplier: h.applier, sweep: map[proto.TargetKey]probe.Fn{direct: okProbe, awgDirect: okProbe}}
+	hosts := &fakeHosts{}
+	loop := NewLoop(Deps{
+		API: h.client, State: h.dir, File: h.file, Buffer: h.buffer,
+		Runner:  probe.NewRunner(slog.New(slog.NewTextHandler(h.logs, nil))),
+		Applier: applier, Clock: h.clk,
+		Sleep: func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+		Rand:  mrand.New(mrand.NewPCG(7, 8)),
+		Log:   slog.New(slog.NewTextHandler(h.logs, nil)),
+		Hosts: hosts,
+	})
+
+	h.stub.SetSweep(&proto.SweepJob{Kinds: []string{"xray"}, Hosts: []proto.SweepJobHost{{Name: "edge-a", Host: "a.example.net"}, {Name: "", Host: "real.example.net"}}})
+	for i := 0; i < 3; i++ {
+		if err := loop.Once(context.Background()); err != nil {
+			t.Fatalf("Once %d: %v", i, err)
+		}
+	}
+	hbs := h.stub.Heartbeats()
+	if len(hbs) != 3 {
+		t.Fatalf("%d heartbeats, want 3", len(hbs))
+	}
+	last := func(hb proto.HeartbeatRequest) proto.Cycle { return hb.Cycles[len(hb.Cycles)-1] }
+	if c := last(hbs[0]); c.Sweep != nil {
+		t.Fatalf("first cycle has a sweep block %+v before any was asked for", c.Sweep)
+	}
+	c := last(hbs[1])
+	if c.Sweep == nil {
+		t.Fatal("the cycle after the answer that asked for a sweep has no sweep block")
+	}
+	if len(c.Results) != 1 || c.Results[0].TargetKey != targetKey() {
+		t.Fatalf("results = %+v, want the every-cycle target only", c.Results)
+	}
+	if len(c.Sweep.Results) != 1 || c.Sweep.Results[0].TargetKey != direct || !c.Sweep.Results[0].Ok {
+		t.Fatalf("sweep results = %+v, want the xray sweep target only", c.Sweep.Results)
+	}
+	if len(c.Sweep.Hosts) != 2 || c.Sweep.Hosts[1].Name != "" || c.Sweep.Hosts[1].LossPct != 10 {
+		t.Fatalf("sweep hosts = %+v, want both checks", c.Sweep.Hosts)
+	}
+	if c := last(hbs[2]); c.Sweep != nil {
+		t.Fatalf("the cycle after the sweep ran again: %+v", c.Sweep)
+	}
+	if len(hosts.calls) != 1 {
+		t.Fatalf("%d host check runs, want 1", len(hosts.calls))
+	}
+}

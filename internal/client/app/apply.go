@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -95,9 +96,10 @@ type RevisionApplier struct {
 	mu       sync.Mutex
 	doc      *proto.ConfigDoc
 	probes   map[proto.TargetKey]probe.Fn
-	xrayKeys map[proto.TargetKey]bool // the applied xray-targets, skipped while xray is down
-	ports    []int                    // the socks ports of the applied revision, for recovery
-	rejected []proto.RejectedTarget   // the applied revision's targets that are not probed
+	sweep    map[proto.TargetKey]probe.Fn // the applied sweepTargets' probes (decision #100)
+	xrayKeys map[proto.TargetKey]bool     // the applied xray-targets, skipped while xray is down
+	ports    []int                        // the socks ports of the applied revision, for recovery
+	rejected []proto.RejectedTarget       // the applied revision's targets that are not probed
 	lastErr  error
 	// xrayDown is set while the xray child is dead and a restart before
 	// the cycle did not bring it back (decision #53 п. 4). It overrides
@@ -112,6 +114,7 @@ var (
 	_ CycleGuard = (*RevisionApplier)(nil)
 	_ Reviver    = (*RevisionApplier)(nil)
 	_ Rejecter   = (*RevisionApplier)(nil)
+	_ Sweeper    = (*RevisionApplier)(nil)
 )
 
 // NewRevisionApplier wires an applier to its probers, its xray child and
@@ -169,6 +172,29 @@ func (a *RevisionApplier) Applied() (*proto.ConfigDoc, map[proto.TargetKey]probe
 		}
 	}
 	return a.doc, probes, a.xrayDown
+}
+
+// SweepProbes is the loop's Sweeper (decision #100): the probes of the
+// applied document's sweepTargets of the given inbound kinds, for a cycle
+// that runs a diagnostic sweep. They were applied with the revision — the
+// xray child already has their outbounds — so a sweep restarts nothing.
+// While the xray child is down its targets are left out, as in Applied.
+func (a *RevisionApplier) SweepProbes(kinds []string) map[proto.TargetKey]probe.Fn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[proto.TargetKey]probe.Fn)
+	for k, fn := range a.sweep {
+		if a.xrayDown != nil && a.xrayKeys[k] {
+			continue
+		}
+		for _, kind := range kinds {
+			if k.InboundKind == kind {
+				out[k] = fn
+				break
+			}
+		}
+	}
+	return out
 }
 
 // Rejected is the loop's Rejecter: the targets of the applied revision
@@ -269,7 +295,8 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 		}
 	}
 
-	probes := a.buildProbes(doc, plans, awgs)
+	all := a.buildProbes(doc, plans, awgs)
+	probes, sweep := splitSweep(doc, all)
 
 	// appliedRevision is recorded *before* the probe set is swapped, and a
 	// failure to record it fails the whole apply. The other order looks
@@ -299,7 +326,7 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 	}
 
 	a.mu.Lock()
-	a.doc, a.probes, a.ports, a.rejected, a.lastErr = doc, probes, ports, rejected, nil
+	a.doc, a.probes, a.sweep, a.ports, a.rejected, a.lastErr = doc, probes, sweep, ports, rejected, nil
 	a.xrayKeys = xrayKeys(plans)
 	// The child was just (re)started on this revision, or the revision has
 	// no xray-targets: either way there is no dead child to report.
@@ -307,8 +334,8 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 	a.mu.Unlock()
 
 	// Spec §7's revision line: what was applied and how much of it.
-	a.d.Log.Info(fmt.Sprintf("applied revision %s: %d xray targets, %d awg targets, %d rejected",
-		doc.ConfigRevision, len(plans), len(awgs), len(rejected)))
+	a.d.Log.Info(fmt.Sprintf("applied revision %s: %d xray targets, %d awg targets (%d of them for the diagnostic sweep), %d rejected",
+		doc.ConfigRevision, len(plans), len(awgs), len(sweep), len(rejected)))
 	return nil
 }
 
@@ -494,7 +521,10 @@ func parseDoc(doc *proto.ConfigDoc) ([]byte, []config.XrayPlan, map[proto.Target
 	reject := func(key proto.TargetKey, err error) {
 		rejected = append(rejected, proto.RejectedTarget{Target: key.String(), Error: firstLine(err.Error())})
 	}
-	for _, t := range doc.Targets {
+	// The sweep targets (decision #100) are parsed and applied exactly like
+	// the others — a bad one is rejected on its own — and only split off
+	// when the probes are built (splitSweep).
+	for _, t := range append(slices.Clip(doc.Targets), doc.SweepTargets...) {
 		switch {
 		case t.Link != "":
 			// BuildXray parses the link again; parsing it here first is
@@ -524,6 +554,26 @@ func parseDoc(doc *proto.ConfigDoc) ([]byte, []config.XrayPlan, map[proto.Target
 		return nil, nil, nil, nil, err
 	}
 	return cfgJSON, plans, awgs, rejected, nil
+}
+
+// splitSweep separates a revision's probes into the ones every cycle runs
+// (the document's targets) and the ones only a diagnostic sweep runs (its
+// sweepTargets). A key in both is an every-cycle target.
+func splitSweep(doc *proto.ConfigDoc, all map[proto.TargetKey]probe.Fn) (probes, sweep map[proto.TargetKey]probe.Fn) {
+	steady := make(map[proto.TargetKey]bool, len(doc.Targets))
+	for _, t := range doc.Targets {
+		steady[t.TargetKey] = true
+	}
+	probes = make(map[proto.TargetKey]probe.Fn, len(doc.Targets))
+	sweep = make(map[proto.TargetKey]probe.Fn)
+	for k, fn := range all {
+		if steady[k] {
+			probes[k] = fn
+		} else {
+			sweep[k] = fn
+		}
+	}
+	return probes, sweep
 }
 
 // xrayKeys is the set of targets a revision probes through the xray child.

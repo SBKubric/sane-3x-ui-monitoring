@@ -777,3 +777,43 @@ func TestRevive_NothingToDoWithoutXrayTargets(t *testing.T) {
 		t.Errorf("Applied = %d probes, err %v; want the AWG probe and no error", len(probes), cfgErr)
 	}
 }
+
+// TestApply_SweepTargetsAreKeptReady is decision #100's mon-client side of
+// sweepTargets: they are applied with the revision — an xray one gets its
+// outbound and socks port in xray.json, so a sweep restarts nothing — but
+// they are not in the every-cycle probe set; SweepProbes hands them out by
+// inbound kind, and a broken one is rejected like any target.
+func TestApply_SweepTargetsAreKeptReady(t *testing.T) {
+	h := newApplierHarness(t, true)
+	d := revisionDoc("rev1", xrayTarget("proxy", vlessRealityLink))
+	sweepXray := xrayTarget("direct", trojanGRPCLink)
+	sweepAwg := awgTarget()
+	sweepAwg.Path = "direct"
+	broken := awgTargetWith(2, strings.Replace(awgConf, "Jc = 4", "Jc = four", 1))
+	broken.Path = "inner:core-1"
+	d.SweepTargets = []proto.Target{sweepXray, sweepAwg, broken}
+
+	if err := h.applier.Apply(context.Background(), d); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	_, probes, cfgErr := h.applier.Applied()
+	if cfgErr != nil || len(probes) != 1 {
+		t.Fatalf("Applied = %d probes, err %v; want the one every-cycle target", len(probes), cfgErr)
+	}
+	if _, ok := probes[xrayTarget("proxy", vlessRealityLink).TargetKey]; !ok {
+		t.Fatal("the every-cycle target is not in the probe set")
+	}
+	if got := h.applier.SweepProbes([]string{"xray"}); len(got) != 1 || got[sweepXray.TargetKey] == nil {
+		t.Fatalf("SweepProbes(xray) = %v, want the xray sweep target", got)
+	}
+	if got := h.applier.SweepProbes([]string{"xray", "awg"}); len(got) != 2 {
+		t.Fatalf("SweepProbes(xray, awg) = %d probes, want both kinds' sweep targets", len(got))
+	}
+	if cfg := h.xrayJSON(t); !strings.Contains(cfg, "in-xray-12-direct") {
+		t.Fatalf("xray.json has no inbound for the xray sweep target:\n%s", cfg)
+	}
+	rejected := h.applier.Rejected()
+	if len(rejected) != 1 || rejected[0].Target != broken.TargetKey.String() {
+		t.Fatalf("rejected = %+v, want the broken sweep target", rejected)
+	}
+}

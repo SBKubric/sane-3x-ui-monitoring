@@ -21,6 +21,7 @@ import (
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/api"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/heartbeat"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/hostcheck"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/probe"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/proto"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/state"
@@ -108,6 +109,21 @@ type Rejecter interface {
 	Rejected() []proto.RejectedTarget
 }
 
+// Sweeper is an optional extension of Applier for an applier that keeps a
+// document's sweepTargets ready (decision #100): SweepProbes hands out the
+// probes of those of the given inbound kinds, for a cycle that runs a
+// diagnostic sweep. An applier that does not implement it has nothing to
+// sweep; the host reachability checks still run.
+type Sweeper interface {
+	SweepProbes(kinds []string) map[proto.TargetKey]probe.Fn
+}
+
+// HostChecker runs the host reachability checks of a diagnostic sweep
+// (*hostcheck.Checker).
+type HostChecker interface {
+	Check(ctx context.Context, hosts []proto.SweepJobHost) []proto.HostCheck
+}
+
 // Deps are everything the loop needs and does not build itself. Every
 // field that has a sensible production default gets one in NewLoop, so a
 // test only overrides the seams it wants to control (Clock, Sleep, Rand).
@@ -150,6 +166,9 @@ type Deps struct {
 	XrayVersion func() string
 	// StartedAt is the process start, for uptimeMs.
 	StartedAt time.Time
+	// Hosts runs a diagnostic sweep's host reachability checks. Defaults
+	// to a hostcheck.Checker on an unprivileged ICMP socket.
+	Hosts HostChecker
 }
 
 // Loop is one running mon-client. It is not safe for concurrent use: Run
@@ -161,6 +180,11 @@ type Loop struct {
 	// start (spec §4.1) and set again whenever a heartbeat answers with a
 	// revision other than the applied one (spec §6).
 	needConfig bool
+
+	// sweep is the diagnostic sweep run the last heartbeat answer asked
+	// for (decision #100), run by the next cycle and then forgotten: every
+	// run is asked for on its own.
+	sweep *proto.SweepJob
 }
 
 // NewLoop returns a Loop over d, filling in every dependency with a
@@ -183,6 +207,9 @@ func NewLoop(d Deps) *Loop {
 	}
 	if d.StartedAt.IsZero() {
 		d.StartedAt = d.Clock.Now()
+	}
+	if d.Hosts == nil {
+		d.Hosts = &hostcheck.Checker{}
 	}
 	if d.Buffer != nil && d.File != nil {
 		// Decision #51 §1: a cycles.json that was lost or discarded as
@@ -248,8 +275,8 @@ func (l *Loop) Once(ctx context.Context) error {
 		r.Revive(ctx)
 	}
 
-	doc, results, ts, rejected, configErr := l.cycle(ctx)
-	if _, err := l.d.Buffer.Add(ts, results); err != nil {
+	doc, results, sweep, ts, rejected, configErr := l.cycle(ctx)
+	if _, err := l.d.Buffer.AddCycle(ts, results, sweep); err != nil {
 		// The cycle is in the buffer, just not on disk: the heartbeat
 		// below still carries it, and only a restart before the next
 		// successful save would lose it (spec §6).
@@ -284,6 +311,10 @@ func (l *Loop) Once(ctx context.Context) error {
 	if err := l.d.Buffer.Ack(resp.AckSeq); err != nil {
 		l.log().Error("cycles buffer not persisted", "error", err)
 	}
+	if resp.Sweep != nil {
+		l.log().Info("diagnostic sweep requested for the next cycle", "kinds", resp.Sweep.Kinds, "hosts", len(resp.Sweep.Hosts))
+	}
+	l.sweep = resp.Sweep
 	l.rememberAck(resp.AckSeq)
 	// Spec §7's heartbeat line.
 	l.log().Info(fmt.Sprintf("ack %d", resp.AckSeq))
@@ -327,7 +358,12 @@ func (l *Loop) rememberAck(ackSeq int64) {
 // runner only ever probes what it was handed, a result for a key the
 // applied document no longer has must not reach a heartbeat even if some
 // future applier hands one back.
-func (l *Loop) cycle(ctx context.Context) (doc *proto.ConfigDoc, results []proto.Result, ts int64, rejected []proto.RejectedTarget, configErr error) {
+//
+// A cycle the last heartbeat answer asked a diagnostic sweep of (decision
+// #100) also probes the sweep targets of the job's kinds, at the same time
+// and under the same budgets, and runs the job's host reachability checks
+// alongside; their results go in the cycle's sweep block, not in results.
+func (l *Loop) cycle(ctx context.Context) (doc *proto.ConfigDoc, results []proto.Result, sweep *proto.CycleSweep, ts int64, rejected []proto.RejectedTarget, configErr error) {
 	if g, ok := l.d.Applier.(CycleGuard); ok {
 		g.BeginCycle()
 		defer g.EndCycle()
@@ -335,8 +371,46 @@ func (l *Loop) cycle(ctx context.Context) (doc *proto.ConfigDoc, results []proto
 	doc, probes, configErr := l.d.Applier.Applied()
 	rejected = l.rejected()
 	ts = clock.Ms(l.d.Clock.Now())
-	results = l.d.Runner.Cycle(ctx, probes, probe.BudgetsFrom(probeParams(doc)))
-	return doc, applied(results, probes), ts, rejected, configErr
+	job := l.sweep
+	l.sweep = nil
+	if job == nil {
+		results = l.d.Runner.Cycle(ctx, probes, probe.BudgetsFrom(probeParams(doc)))
+		return doc, applied(results, probes), nil, ts, rejected, configErr
+	}
+
+	var sweepProbes map[proto.TargetKey]probe.Fn
+	if s, ok := l.d.Applier.(Sweeper); ok {
+		sweepProbes = s.SweepProbes(job.Kinds)
+	}
+	all := make(map[proto.TargetKey]probe.Fn, len(probes)+len(sweepProbes))
+	for k, fn := range sweepProbes {
+		all[k] = fn
+	}
+	for k, fn := range probes {
+		all[k] = fn
+	}
+	var hosts []proto.HostCheck
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		hosts = l.d.Hosts.Check(ctx, job.Hosts)
+	}()
+	everything := l.d.Runner.Cycle(ctx, all, probe.BudgetsFrom(probeParams(doc)))
+	<-done
+
+	sweep = &proto.CycleSweep{Kinds: job.Kinds, Results: []proto.Result{}, Hosts: hosts}
+	if sweep.Hosts == nil {
+		sweep.Hosts = []proto.HostCheck{}
+	}
+	for _, r := range everything {
+		if _, ok := probes[r.TargetKey]; ok {
+			results = append(results, r)
+		} else if _, ok := sweepProbes[r.TargetKey]; ok {
+			sweep.Results = append(sweep.Results, r)
+		}
+	}
+	l.log().Info(fmt.Sprintf("diagnostic sweep: %d tunnel probes, %d host checks", len(sweep.Results), len(sweep.Hosts)))
+	return doc, applied(results, probes), sweep, ts, rejected, configErr
 }
 
 // rejected is the applier's Rejected, or nothing for an applier that is

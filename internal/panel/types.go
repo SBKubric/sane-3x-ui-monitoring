@@ -74,11 +74,59 @@ type Probe struct {
 // "inner" — the address the panel renders its probe links with, and its
 // registry state. The panel lists only joined and legacy hops, the ones
 // that are probed.
+//
+// Next and NextHopCheck are the compatible contract-3 addition of decision
+// #100: the name of the hop's next hop towards the panel ("" for the real
+// server itself), and the hop's own last host reachability check of it.
+// Both are optional — an older panel sends neither, and NextHopCheck is
+// absent until the hop has reported once — and nil means "not said".
 type Hop struct {
-	Name  string `json:"name"`
-	Role  string `json:"role"`
-	Host  string `json:"host"`
-	State string `json:"state"`
+	Name         string    `json:"name"`
+	Role         string    `json:"role"`
+	Host         string    `json:"host"`
+	State        string    `json:"state"`
+	Next         *string   `json:"next,omitempty"`
+	NextHopCheck *HopCheck `json:"nextHopCheck,omitempty"`
+}
+
+// HopCheck is a hop's host reachability check of its next hop (decision
+// #100, CONTEXT.md: Host reachability check): when it was measured, how
+// many ICMP echoes were sent, the loss and the average round trip — nil
+// when every echo was lost. It is not part of the panel's revision.
+type HopCheck struct {
+	At       int64  `json:"at"`
+	Sent     int    `json:"sent"`
+	LossPct  int    `json:"lossPct"`
+	RttAvgMs *int64 `json:"rttAvgMs"`
+}
+
+// NextName is the hop's next hop: Next when the panel says it, otherwise
+// what the chain's order implies (an older panel): the inner hops are
+// listed from the panel outwards and the edges sit outside the last of
+// them, so an inner hop's next is the inner one before it ("" — the real
+// server — for the first), and an edge's is the last inner hop.
+func (c *Chain) NextName(h Hop) string {
+	if h.Next != nil {
+		return *h.Next
+	}
+	var inner []string
+	for _, o := range c.ProbedHops() {
+		if o.Role == store.HopRoleInner {
+			inner = append(inner, o.Name)
+		}
+	}
+	if h.Role == store.HopRoleEdge {
+		if len(inner) == 0 {
+			return ""
+		}
+		return inner[len(inner)-1]
+	}
+	for i, name := range inner {
+		if name == h.Name && i > 0 {
+			return inner[i-1]
+		}
+	}
+	return ""
 }
 
 // Path is the hop's path, edge:<name> or inner:<name> (spec §5.1).

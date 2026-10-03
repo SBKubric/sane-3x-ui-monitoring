@@ -82,3 +82,25 @@ func MsgTargetRecovered(monClientName, region, inboundKind string, inboundID int
 func MsgMonClientTransition(monClientName, region, from, to string) string {
 	return fmt.Sprintf("%s mon-client %s (%s) %s → %s", viaMonServerMark, monClientName, region, from, to)
 }
+
+// MsgSweep formats a diagnostic sweep's summary sent by mon-server itself
+// while PANEL_DOWN (spec §4.1, decision #100) — normally the panel sends
+// its own: a head line with the phase, then the report one line each, e.g.:
+//
+//	[via mon-server] sweep start: awg unreachable through every edge · ams-1 (NL)
+//	tunnel edge:proxy ❌ awg_no_handshake
+//	ICMP mon-client → proxy ✅ 0% · 2 ms
+func MsgSweep(monClientName, region, inboundKind, phase string, lines []string) string {
+	head := "unreachable through every edge"
+	switch phase {
+	case "change":
+		head = "unreachable through every edge, the picture changed"
+	case "end":
+		head = "reachable through an edge again"
+	}
+	text := fmt.Sprintf("%s sweep %s: %s %s · %s (%s)", viaMonServerMark, phase, inboundKind, head, monClientName, region)
+	if len(lines) > 0 {
+		text += "\n" + strings.Join(lines, "\n")
+	}
+	return text
+}

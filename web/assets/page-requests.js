@@ -9,9 +9,10 @@
     approveTitle: 'Approve registration request',
     compareCode: "Compare the code with the box's log before approving.",
     pathsHint: 'edges (the default) probes every edge front of the chain every cycle, active and standby, including edges that join later; ' +
-      'direct and the inner hops are then held without probing — an inner hop is UP while an edge of its kind is UP. ' +
+      'direct and the inner hops are then held without probing every cycle — an inner hop is UP while an edge of its kind is UP — ' +
+      'and checked in a diagnostic sweep while no edge is UP, so the box also gets their probe material, the real server\'s address included. ' +
       'hops probes every hop of the chain every cycle, including hops that join later (both are proxy while the panel has no chain). ' +
-      'Uncheck direct on boxes in hostile regions: it reveals the real server\'s address to that box. ' +
+      'On boxes in hostile regions use neither direct nor edges (pick hops or hops by name): both reveal the real server\'s address to that box. ' +
       'Uncheck hops to pick hops by name — an inner hop is not reachable from every region.',
     noHops: 'The panel has no probed hops right now.',
     replaceHint: 'The replacement keeps the existing id, its history, name, region and paths; the old token is revoked on approve.',

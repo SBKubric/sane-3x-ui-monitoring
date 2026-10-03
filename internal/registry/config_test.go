@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"slices"
@@ -1161,5 +1162,78 @@ func TestExclusions_Edges(t *testing.T) {
 	}
 	if strings.Join(expected, ",") != "direct,edge:edge-a,edge:edge-b,inner:core-1" {
 		t.Fatalf("Expected(awg) = %v, want every held path", expected)
+	}
+}
+
+// TestRebuild_SweepTargets is decision #100's sweep material: a mon-client
+// on edges gets its held targets — direct and the inner hop, AWG only with
+// its own peer — as sweepTargets next to the edge targets, so a diagnostic
+// sweep can probe them without a new revision; a mon-client on direct and
+// hops, which probes everything every cycle, gets none, and its document —
+// revision included — is what it was before sweepTargets existed.
+func TestRebuild_SweepTargets(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	mat.m = chainMaterial("edge-a")
+	edges := approve(t, r, clk, "ams-1", []string{store.PathEdges})
+	full := approve(t, r, clk, "fra-1", []string{store.PathDirect, store.PathHops})
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+
+	doc := mustCurrent(t, b, edges.Id)
+	var sweep []string
+	for _, ct := range doc.SweepTargets {
+		sweep = append(sweep, ct.InboundKind+":"+strconv.Itoa(ct.InboundID)+"/"+ct.Path)
+		if ct.Link == "" && ct.Conf == "" {
+			t.Errorf("sweep target %s/%s carries no material", ct.InboundKind, ct.Path)
+		}
+	}
+	if got := strings.Join(sweep, ","); got != "awg:0/direct,awg:0/inner:core-1,xray:12/direct,xray:12/inner:core-1" {
+		t.Fatalf("ams-1 sweepTargets = %s", got)
+	}
+	if got := mustCurrent(t, b, full.Id); len(got.SweepTargets) != 0 {
+		t.Fatalf("fra-1 sweepTargets = %v, want none", got.SweepTargets)
+	}
+	raw, _ := json.Marshal(mustCurrent(t, b, full.Id))
+	if strings.Contains(string(raw), "sweepTargets") {
+		t.Fatalf("a document without sweep targets names the field: %s", raw)
+	}
+}
+
+// TestExclusions_SweepHosts is decision #100's host list: the hops a
+// mon-client holds and the real server while it holds direct — the
+// addresses its own material names, and no others.
+func TestExclusions_SweepHosts(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	m := chainMaterial("edge-a")
+	m.Host = "real.example.net"
+	mat.m = m
+	edges := approve(t, r, clk, "ams-1", []string{store.PathEdges})
+	named := approve(t, r, clk, "fra-1", []string{"edge:edge-b"})
+
+	render := func(id string) string {
+		t.Helper()
+		x, err := b.Exclusions(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Exclusions: %v", err)
+		}
+		var out []string
+		for _, h := range x.Hosts {
+			out = append(out, h.Name+"="+h.Host)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := render(edges.Id); got != "core-1=10.0.0.7,edge-a=a.example.net,edge-b=b.example.net,=real.example.net" {
+		t.Fatalf("ams-1 hosts = %s", got)
+	}
+	if got := render(named.Id); got != "edge-b=b.example.net" {
+		t.Fatalf("fra-1 hosts = %s, want only the hop it holds", got)
+	}
+
+	flat := sampleMaterial()
+	flat.Host = "real.example.net"
+	mat.m = flat
+	if got := render(edges.Id); got != "proxy=front.example.net,=real.example.net" {
+		t.Fatalf("ams-1 hosts without a chain = %s", got)
 	}
 }
