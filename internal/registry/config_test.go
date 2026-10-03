@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -528,10 +529,13 @@ func TestSnapshotSource(t *testing.T) {
 	}
 }
 
-// TestSnapshotSource_Paths checks contract 3 §4.3: the snapshot carries
-// every mon-client's paths as stored, with the default applied to a row
-// that has none, so the panel keeps AWG probe peers only for the pairs each
-// one probes.
+// TestSnapshotSource_Paths checks contract 3 §4.3 with decision #100: the
+// snapshot carries every path each mon-client holds targets on, so the
+// panel keeps AWG probe peers for exactly those pairs. A vocabulary without
+// edges goes as stored; edges — stored, or the default applied to a row
+// that has none — goes as the whole chain, direct and hops, in the words
+// the panel knows, since a diagnostic sweep needs probe material on every
+// path.
 func TestSnapshotSource_Paths(t *testing.T) {
 	r, st, clk := newTestRegistry(t)
 	mc := approve(t, r, clk, "ams-1", []string{store.PathDirect})
@@ -539,6 +543,7 @@ func TestSnapshotSource_Paths(t *testing.T) {
 		t.Fatalf("clear paths: %v", err)
 	}
 	approve(t, r, clk, "msk-1", []string{store.PathDirect})
+	approve(t, r, clk, "fra-1", []string{store.PathEdges, "inner:core-1"})
 
 	snap, err := r.SnapshotSource().Snapshot(context.Background())
 	if err != nil {
@@ -548,8 +553,11 @@ func TestSnapshotSource_Paths(t *testing.T) {
 	for _, s := range snap {
 		got[s.Id] = strings.Join(s.Paths, ",")
 	}
-	if got["ams-1"] != strings.Join(pathsOf(&store.MonClient{}), ",") || got["msk-1"] != "direct" {
-		t.Fatalf("snapshot paths = %v, want the default for ams-1 and direct for msk-1", got)
+	want := map[string]string{"ams-1": "direct,hops", "msk-1": "direct", "fra-1": "direct,hops,inner:core-1"}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("snapshot paths of %s = %q, want %q", id, got[id], w)
+		}
 	}
 }
 
@@ -870,9 +878,10 @@ func chainMaterial(active string) panel.Material {
 }
 
 // TestExpandPaths is spec §5.1's table: direct is direct; hops is every
-// probed hop — or proxy on a panel without one; a hop by name is that hop
-// while it is probed and nothing otherwise; a repeat after expansion is one
-// path.
+// probed hop — or proxy on a panel without one; edges is every probed edge,
+// active and standby — or proxy on a panel without one (decision #100); a
+// hop by name is that hop while it is probed and nothing otherwise; a
+// repeat after expansion is one path.
 func TestExpandPaths(t *testing.T) {
 	flat := sampleMaterial()
 	chained := chainMaterial("edge-a")
@@ -890,6 +899,10 @@ func TestExpandPaths(t *testing.T) {
 		{"chain, hops by name", chained, []string{"edge:edge-b", "inner:core-1"}, "edge:edge-b,inner:core-1"},
 		{"chain, a hop that is not probed", chained, []string{store.PathDirect, "edge:gone", "inner:edge-a"}, "direct"},
 		{"chain, hops and a name", chained, []string{store.PathHops, "edge:edge-a"}, "inner:core-1,edge:edge-a,edge:edge-b"},
+		{"no chain, edges", flat, []string{store.PathEdges}, "proxy"},
+		{"chain, edges", chained, []string{store.PathEdges}, "edge:edge-a,edge:edge-b"},
+		{"chain, edges and direct", chained, []string{store.PathEdges, store.PathDirect}, "edge:edge-a,edge:edge-b,direct"},
+		{"chain, edges and an inner by name", chained, []string{store.PathEdges, "inner:core-1"}, "edge:edge-a,edge:edge-b,inner:core-1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1034,5 +1047,119 @@ func TestExclusions_Chain(t *testing.T) {
 	x, _ = b.Exclusions(context.Background(), all.Id)
 	if x.Retired(key(store.InboundKindXray, store.PathProxy)) {
 		t.Fatal("a target was retired without material")
+	}
+}
+
+// TestEdges_LaterEdgeJoins is decision #100: edges follows the chain — an
+// edge that joins after approval is probed without editing the
+// mon-client, and an inner hop never is.
+func TestEdges_LaterEdgeJoins(t *testing.T) {
+	m := chainMaterial("edge-a")
+	m.Chain.Hops = append(m.Chain.Hops,
+		panel.Hop{Name: "edge-c", Role: "edge", Host: "c.example.net", State: "joined"},
+		panel.Hop{Name: "core-2", Role: "inner", Host: "10.0.0.8", State: "joined"},
+		panel.Hop{Name: "edge-d", Role: "edge", Host: "d.example.net", State: "pending"})
+	if got := strings.Join(ExpandPaths([]string{store.PathEdges}, m), ","); got != "edge:edge-a,edge:edge-b,edge:edge-c" {
+		t.Fatalf("ExpandPaths(edges) = %s, want every probed edge", got)
+	}
+}
+
+// TestMonitoredPaths is decision #100: a mon-client on edges holds targets
+// on the whole chain — direct and every hop — so the ensure snapshot asks
+// the panel for probe material on all of them; a vocabulary without edges
+// holds exactly what it probes.
+func TestMonitoredPaths(t *testing.T) {
+	flat := sampleMaterial()
+	chained := chainMaterial("edge-a")
+	cases := []struct {
+		name      string
+		mat       panel.Material
+		vocab     []string
+		wantVocab string
+		want      string
+	}{
+		{"edges on a chain", chained, []string{store.PathEdges}, "direct,hops", "direct,inner:core-1,edge:edge-a,edge:edge-b"},
+		{"edges without a chain", flat, []string{store.PathEdges}, "direct,hops", "direct,proxy"},
+		{"edges with an inner by name", chained, []string{store.PathEdges, "inner:core-1"}, "direct,hops,inner:core-1", "direct,inner:core-1,edge:edge-a,edge:edge-b"},
+		{"explicit vocabulary", chained, []string{"edge:edge-b"}, "edge:edge-b", "edge:edge-b"},
+		{"direct and hops", chained, []string{store.PathDirect, store.PathHops}, "direct,hops", "direct,inner:core-1,edge:edge-a,edge:edge-b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strings.Join(MonitoredVocab(tc.vocab), ","); got != tc.wantVocab {
+				t.Errorf("MonitoredVocab(%v) = %s, want %s", tc.vocab, got, tc.wantVocab)
+			}
+			if got := strings.Join(MonitoredPaths(tc.vocab, tc.mat), ","); got != tc.want {
+				t.Errorf("MonitoredPaths(%v) = %s, want %s", tc.vocab, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExclusions_Edges is decision #100 for a mon-client on edges: its
+// document holds only the edge targets, while direct and the inner hop are
+// derived targets — held with their probe material, neither PAUSED nor
+// retired — and an AWG target on a held path the panel gave it no peer for
+// is still no_probe_link.
+func TestExclusions_Edges(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	mat.m = chainMaterial("edge-a")
+	ams := approve(t, r, clk, "ams-1", []string{store.PathEdges})
+	fra := approve(t, r, clk, "fra-1", []string{store.PathEdges})
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+
+	want := "awg:0/edge:edge-a,awg:0/edge:edge-b,xray:12/edge:edge-a,xray:12/edge:edge-b"
+	if got := strings.Join(keysOf(mustCurrent(t, b, ams.Id)), ","); got != want {
+		t.Fatalf("ams-1 targets = %s, want the edges only: %s", got, want)
+	}
+
+	derived := func(id string) (Exclusions, string) {
+		t.Helper()
+		x, err := b.Exclusions(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Exclusions(%s): %v", id, err)
+		}
+		var keys []TargetKey
+		for k := range x.Derived {
+			keys = append(keys, k)
+		}
+		slices.SortFunc(keys, func(a, b TargetKey) int {
+			return strings.Compare(a.InboundKind+"/"+a.Path, b.InboundKind+"/"+b.Path)
+		})
+		var out []string
+		for _, k := range keys {
+			out = append(out, k.InboundKind+":"+strconv.Itoa(k.InboundID)+"/"+k.Path)
+		}
+		return x, strings.Join(out, ",")
+	}
+
+	x, got := derived(ams.Id)
+	if got != "awg:0/direct,awg:0/inner:core-1,xray:12/direct,xray:12/inner:core-1" {
+		t.Fatalf("ams-1 derived = %s, want direct and the inner hop of both kinds", got)
+	}
+	for k := range x.Derived {
+		if r := x.Reason(k); r != "" || x.Retired(k) {
+			t.Errorf("derived %+v: reason %q retired %v, want neither", k, r, x.Retired(k))
+		}
+	}
+
+	// fra-1 has no AWG peer on the inner hop (chainMaterial): no AWG
+	// derived target there, and it is no_probe_link.
+	x, got = derived(fra.Id)
+	if got != "awg:0/direct,xray:12/direct,xray:12/inner:core-1" {
+		t.Fatalf("fra-1 derived = %s, want no AWG one on the inner hop", got)
+	}
+	awgInner := TargetKey{InboundKind: store.InboundKindAwg, InboundID: 0, Path: "inner:core-1"}
+	if r := x.Reason(awgInner); r != PauseNoProbeLink {
+		t.Fatalf("fra-1 awg inner reason = %q, want no_probe_link", r)
+	}
+	var expected []string
+	for _, k := range x.Expected(store.InboundKindAwg) {
+		expected = append(expected, k.Path)
+	}
+	if strings.Join(expected, ",") != "direct,edge:edge-a,edge:edge-b,inner:core-1" {
+		t.Fatalf("Expected(awg) = %v, want every held path", expected)
 	}
 }

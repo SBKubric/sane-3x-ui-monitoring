@@ -844,7 +844,7 @@ func TestStats_WiredIntoServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1", Paths: []string{store.PathDirect, store.PathHops}}); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
 	poll, err := reg.Poll(ctx, out.RequestID)
@@ -958,8 +958,8 @@ func TestProbe_WiredIntoServer(t *testing.T) {
 }
 
 // TestPerHop_WiredEndToEnd walks decision #61 through the wired App against
-// a contract-3 panel stub: a mon-client on the default paths probes direct
-// and proxy while the panel has no chain; once a hop is probed, proxy's
+// a contract-3 panel stub: a mon-client on paths direct and hops probes
+// direct and proxy while the panel has no chain; once a hop is probed, proxy's
 // target is removed without an event and the hop's target takes its place;
 // switching the active edge changes neither the config revision nor any
 // target; a hop that leaves takes its targets with it, silently.
@@ -1004,7 +1004,7 @@ func TestPerHop_WiredEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1", Paths: []string{store.PathDirect, store.PathHops}}); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
 

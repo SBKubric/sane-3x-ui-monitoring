@@ -53,8 +53,16 @@ func register(t *testing.T, r *Registry, hostname, publicIP, remoteIP string) *R
 // approve registers and immediately approves under name, failing the test
 // on error. It advances clk by rateLimitWindow first so a series of these
 // never trip the per-IP 1/minute throttle against each other.
+//
+// nil paths approve with the full vocabulary, direct and hops — the
+// default before decision #100, which most tests here were written
+// against; a test of today's default (edges) passes it explicitly or calls
+// Approve itself.
 func approve(t *testing.T, r *Registry, clk *clock.Fake, name string, paths []string) *store.MonClient {
 	t.Helper()
+	if paths == nil {
+		paths = []string{store.PathDirect, store.PathHops}
+	}
 	clk.Advance(rateLimitWindow)
 	out := register(t, r, name, "", "198.51.100.1")
 	mc, err := r.Approve(context.Background(), out.RequestID, ApproveInput{Name: name, Paths: paths})
@@ -488,8 +496,8 @@ func TestApprove_CreatesClientWithHashAndDefaults(t *testing.T) {
 	if !mc.Enabled {
 		t.Fatal("Enabled = false, want true")
 	}
-	if got := mc.PathsList(); !samePaths(got, []string{store.PathDirect, store.PathHops}) {
-		t.Fatalf("Paths = %v, want default [direct hops]", got)
+	if got := mc.PathsList(); !samePaths(got, []string{store.PathEdges}) {
+		t.Fatalf("Paths = %v, want default [edges]", got)
 	}
 
 	poll, err := r.Poll(context.Background(), out.RequestID)

@@ -9,7 +9,9 @@
   'use strict';
 
   var strings = {
-    pathsHint: 'hops follows every probed hop of the chain, including hops that join later (proxy while the panel has no chain). ' +
+    pathsHint: 'edges (the default) probes every edge front of the chain every cycle, active and standby, including edges that join later; ' +
+      'direct and the inner hops are then held without probing — an inner hop is UP while an edge of its kind is UP. ' +
+      'hops probes every hop of the chain every cycle, including hops that join later (both are proxy while the panel has no chain). ' +
       'Uncheck direct on boxes in hostile regions: it reveals the real server\'s address to that box. ' +
       'Uncheck hops to pick hops by name — an inner hop is not reachable from every region.',
     noHops: 'The panel has no probed hops right now.',
