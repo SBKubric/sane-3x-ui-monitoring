@@ -162,25 +162,34 @@ func TestParseLastHandshake(t *testing.T) {
 	}
 }
 
-// TestLogRingKeepsHandshakeFailures checks the device.Logger adapter: only
-// the "Handshake did not complete" lines are kept, and they come back
-// oldest first for use as a Result.Detail (spec §5).
-func TestLogRingKeepsHandshakeFailures(t *testing.T) {
+// TestHandshakeLogCountsAttempts checks the device.Logger adapter: every
+// "Sending handshake initiation" line is one attempt, the retry chatter and
+// unrelated errors are dropped, and an error about an initiation is kept
+// for the awg_no_handshake detail (spec §5, #102).
+func TestHandshakeLogCountsAttempts(t *testing.T) {
 	t.Parallel()
 
-	r := &logRing{}
-	l := r.logger()
-	l.Verbosef("peer(abc) - Sending handshake initiation")
+	h := &handshakeLog{}
+	if got := h.String(); got != "0 handshake attempts" {
+		t.Errorf("fresh log = %q, want %q", got, "0 handshake attempts")
+	}
+	l := h.logger()
+	l.Verbosef("%v - Sending handshake initiation", "peer(abc)")
+	if got := h.String(); got != "1 handshake attempt" {
+		t.Errorf("after one initiation = %q, want %q", got, "1 handshake attempt")
+	}
 	for i := 2; i <= 4; i++ {
-		l.Verbosef("peer(abc) - Handshake did not complete after 5 seconds, retrying (try %d)", i)
+		l.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", "peer(abc)", 5, i)
+		l.Verbosef("%v - Sending handshake initiation", "peer(abc)")
 	}
 	l.Errorf("Routine: receive - stopped")
-
-	lines := r.lines()
-	if len(lines) != 3 {
-		t.Fatalf("kept %d lines, want 3: %v", len(lines), lines)
+	if got := h.String(); got != "4 handshake attempts" {
+		t.Errorf("after four initiations = %q, want %q", got, "4 handshake attempts")
 	}
-	if !strings.HasSuffix(lines[0], "(try 2)") || !strings.HasSuffix(lines[2], "(try 4)") {
-		t.Errorf("lines are not oldest-first: %v", lines)
+
+	l.Errorf("%v - Failed to send handshake initiation: %v", "peer(abc)", "network is unreachable")
+	want := "4 handshake attempts; peer(abc) - Failed to send handshake initiation: network is unreachable"
+	if got := h.String(); got != want {
+		t.Errorf("after a send error = %q, want %q", got, want)
 	}
 }

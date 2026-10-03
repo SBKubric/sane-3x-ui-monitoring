@@ -21,8 +21,8 @@
 
   var probeFields = [
     { key: 'intervalMs', label: 'Probe interval', hint: 'How often a mon-client runs a full probe cycle.' },
-    { key: 'budgetMs', label: 'Cycle budget', hint: 'Wall-clock budget for one whole cycle.' },
-    { key: 'connectMs', label: 'Connect timeout', hint: 'TCP connect timeout per target.' },
+    { key: 'budgetMs', label: 'Probe budget', hint: 'Wall-clock budget for one probe; the targets of a cycle run in parallel, so a cycle takes about one budget. An AWG probe waits for the handshake until this runs out. Keep it well under the interval: budget + heartbeat timeout must fit.' },
+    { key: 'connectMs', label: 'Connect timeout', hint: 'TCP connect timeout per target; for AWG counted from the handshake, which itself may take the whole budget.' },
     { key: 'tlsMs', label: 'TLS timeout', hint: 'TLS handshake timeout per target.' },
     { key: 'headersMs', label: 'Headers timeout', hint: 'Time to first response headers.' },
     { key: 'startJitterMs', label: 'Start jitter', hint: 'Random delay before a cycle so boxes do not synchronise.' },

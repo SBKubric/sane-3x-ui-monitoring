@@ -47,7 +47,7 @@ const readTimeout = 30 * time.Second
 // writeTimeout bounds how long the public listener will wait while writing
 // a response. 60s is generous for any handler this step or the next few
 // steps add, and is deliberately long enough to cover a future heartbeat
-// handler's 20s probe budget (spec §5: budgetMs default 20000) plus margin,
+// handler's 30s probe budget (spec §5: budgetMs default 30000) plus margin,
 // so that step doesn't also need to touch this timeout.
 const writeTimeout = 60 * time.Second
 

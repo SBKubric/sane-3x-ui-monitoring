@@ -31,7 +31,7 @@ const (
 // memoryProbes is how many probes of each kind the test runs after the
 // warm-up. Enough that one-off costs (package-level tables, the first TLS
 // handshake) disappear in the average; few enough that the no-handshake
-// probes, which each wait out their connect budget, stay a couple of
+// probes, which each wait out their whole (short) budget, stay a couple of
 // seconds.
 const memoryProbes = 8
 
@@ -53,7 +53,7 @@ func TestProbeMemoryPerProbeIsBounded(t *testing.T) {
 	okCfg := far.clientConf(t, fmt.Sprintf("127.0.0.1:%d", far.port))
 	deadCfg := confFor(t, "203.0.113.7:51820", "")
 	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: far.pool}}
-	deadBudgets := probe.Budgets{Budget: 5 * time.Second, Connect: 200 * time.Millisecond, TLS: time.Second, Headers: time.Second}
+	deadBudgets := probe.Budgets{Budget: 300 * time.Millisecond, Connect: 200 * time.Millisecond, TLS: time.Second, Headers: time.Second}
 
 	cycle := func() {
 		t.Helper()

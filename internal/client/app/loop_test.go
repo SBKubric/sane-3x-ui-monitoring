@@ -193,7 +193,7 @@ func doc(revision string) *proto.ConfigDoc {
 		ProbeURL:       "https://mon.example/v1/probe",
 		Probe: proto.ProbeParams{
 			IntervalMs:         60_000,
-			BudgetMs:           20_000,
+			BudgetMs:           30_000,
 			StartJitterMs:      5_000,
 			HeartbeatTimeoutMs: 10_000,
 		},
@@ -695,6 +695,37 @@ func TestLoop_RunKeepsAFixedPeriod(t *testing.T) {
 		if d != 35*time.Second {
 			t.Errorf("wait %d = %s, want 35s (the interval minus the 25s cycle)", i+2, d)
 		}
+	}
+}
+
+// TestLoop_RunFitsAFullBudgetCycle is #102's check on the defaults: with
+// the 30 s probe budget, a cycle whose probes all run out their budget and
+// whose heartbeat then waits out its whole timeout (30 s + 10 s) still
+// fits the 60 s interval — the period stays 60 s and no tick is skipped.
+func TestLoop_RunFitsAFullBudgetCycle(t *testing.T) {
+	worst := probe.DefaultBudget + time.Duration(DefaultHeartbeatTimeoutMs)*time.Millisecond
+	interval := time.Duration(DefaultIntervalMs) * time.Millisecond
+	if worst >= interval {
+		t.Fatalf("budget + heartbeat timeout = %s, does not fit the %s interval", worst, interval)
+	}
+
+	var clk *clock.Fake
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): slowProbe(&clk, worst)})
+	clk = h.clk
+	d := doc("rev1")
+	d.Probe.IntervalMs = DefaultIntervalMs
+	d.Probe.BudgetMs = probe.DefaultBudget.Milliseconds()
+	h.stub.SetConfig(d)
+	h.stub.SetRevision("rev1")
+
+	starts := runCycles(t, h, 3)
+	for i := 1; i < len(starts); i++ {
+		if got := time.Duration(starts[i]-starts[i-1]) * time.Millisecond; got != interval {
+			t.Errorf("cycle %d started %s after cycle %d, want the %s interval (starts %v)", i+1, got, i, interval, starts)
+		}
+	}
+	if strings.Contains(h.logs.String(), "skipping") {
+		t.Errorf("a full-budget cycle skipped a tick:\n%s", h.logs.String())
 	}
 }
 
