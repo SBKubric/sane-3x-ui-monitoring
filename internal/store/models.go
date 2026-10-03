@@ -141,7 +141,7 @@ type RegistrationRequest struct {
 func (RegistrationRequest) TableName() string { return "registration_requests" }
 
 // MonClient is one entry of the mon-client registry (spec §3, §6). Paths is
-// stored as a JSON array of the paths vocabulary (`["direct","hops"]`,
+// stored as a JSON array of the paths vocabulary (`["edges"]`, `["direct","hops"]`,
 // spec §5.1); use PathsList/SetPaths
 // rather than touching the column directly so every caller agrees on the
 // encoding. TokenHash is a SHA-256 hex digest — the plaintext token exists

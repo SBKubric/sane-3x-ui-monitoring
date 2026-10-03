@@ -6,10 +6,11 @@ function box(scope: Locator, testId: string): Locator {
   return scope.locator(`input[data-testid="${testId}"], [data-testid="${testId}"] input`).first();
 }
 
-// The paths vocabulary of mon-server.md §5.1 (decision #61): a mon-client
-// probes direct, hops (every probed hop of the chain, proxy while the panel
-// has none) and hops by name. The Approve modal offers direct and hops,
-// both checked (§9.2); the Edit modal shows hops a box names even when the
+// The paths vocabulary of mon-server.md §5.1 (decisions #61, #100): a
+// mon-client probes direct, edges (every probed edge of the chain), hops
+// (every probed hop; both are proxy while the panel has none) and hops by
+// name. The Approve modal offers direct, edges and hops with edges — the
+// default — checked (§9.2); the Edit modal shows hops a box names even when the
 // chain no longer probes them, so saving does not drop them (§9.3). This
 // harness has no panel behind mon-server, so no hop is probed and the path
 // filter has nothing to offer; the chain-dependent parts (the hop list, the
@@ -23,15 +24,16 @@ test('approve with the default paths, then narrow a box to named hops', async ({
   await row.getByTestId('request-approve').click();
   const modal = adminPage.getByTestId('approve-modal');
   await expect(modal).toBeVisible();
-  await expect(box(modal, 'approve-path-direct')).toBeChecked();
-  await expect(box(modal, 'approve-path-hops')).toBeChecked();
-  await expect(modal.getByTestId('approve-path-hop-list')).toHaveCount(0);
+  await expect(box(modal, 'approve-path-edges')).toBeChecked();
+  await expect(box(modal, 'approve-path-direct')).not.toBeChecked();
+  await expect(box(modal, 'approve-path-hops')).not.toBeChecked();
 
-  // Unchecking hops opens the list of hops to name; with no panel there
-  // are none.
-  await box(modal, 'approve-path-hops').uncheck();
+  // With hops unchecked the list of hops to name is open; with no panel
+  // there are none. Checking hops closes it.
   await expect(modal.getByTestId('approve-path-hop-list')).toContainText('no probed hops');
   await box(modal, 'approve-path-hops').check();
+  await expect(modal.getByTestId('approve-path-hop-list')).toHaveCount(0);
+  await box(modal, 'approve-path-hops').uncheck();
 
   const name = `Paths ${Date.now()}`;
   await fieldInput(adminPage, 'approve-name').fill(name);
@@ -40,7 +42,7 @@ test('approve with the default paths, then narrow a box to named hops', async ({
 
   await adminPage.goto('/admin/clients');
   const client = adminPage.getByTestId('client-row').filter({ hasText: name });
-  await expect(client.getByTestId('client-path')).toHaveText(['direct', 'hops']);
+  await expect(client.getByTestId('client-path')).toHaveText(['edges']);
   const id = await client.getAttribute('data-client-id');
 
   // Narrowed to named hops through the API (the chain that would offer
@@ -58,6 +60,7 @@ test('approve with the default paths, then narrow a box to named hops', async ({
   await adminPage.getByTestId('client-edit').click();
   const edit = adminPage.getByTestId('edit-modal');
   await expect(box(edit, 'edit-path-direct')).not.toBeChecked();
+  await expect(box(edit, 'edit-path-edges')).not.toBeChecked();
   await expect(box(edit, 'edit-path-hops')).not.toBeChecked();
   const named = edit.getByTestId('edit-path-hop');
   await expect(named).toHaveCount(2);

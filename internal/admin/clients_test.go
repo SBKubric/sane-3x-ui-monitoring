@@ -244,8 +244,9 @@ func strs(v any) []string {
 
 // TestClients_ListChainAndProbes is spec §9.3 on a chained panel: the page
 // gets the chain's probed hops for the paths picker and the path filter,
-// and every mon-client the paths it probes now — hops expanded, a hop by
-// name only while it is probed — which is what the filter matches on.
+// and every mon-client the paths it probes now — the default edges
+// expanded, a hop by name only while it is probed — which is what the
+// filter matches on.
 func TestClients_ListChainAndProbes(t *testing.T) {
 	h := newHarness(t)
 	h.login()
@@ -273,8 +274,8 @@ func TestClients_ListChainAndProbes(t *testing.T) {
 		probes[row["id"].(string)] = fmt.Sprint(strs(row["probes"]))
 		paths[row["id"].(string)] = fmt.Sprint(strs(row["paths"]))
 	}
-	if probes[all] != "[direct inner:core-1 edge:edge-a edge:edge-b]" || paths[all] != "[direct hops]" {
-		t.Fatalf("%s: paths %s probes %s, want the default expanded into every hop", all, paths[all], probes[all])
+	if probes[all] != "[edge:edge-a edge:edge-b]" || paths[all] != "[edges]" {
+		t.Fatalf("%s: paths %s probes %s, want the default expanded into every edge", all, paths[all], probes[all])
 	}
 	if probes[named] != "[edge:edge-b]" || paths[named] != "[edge:edge-b edge:gone]" {
 		t.Fatalf("%s: paths %s probes %s, want only the probed hop it names", named, paths[named], probes[named])
