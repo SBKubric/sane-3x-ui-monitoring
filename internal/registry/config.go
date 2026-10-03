@@ -68,12 +68,21 @@ type ConfigTarget struct {
 // names exactly as the protocol shows them. It is what a mon-client turns
 // into a running probe cycle, and the only thing about it mon-server ever
 // compares is ConfigRevision.
+//
+// SweepTargets (decision #100, protocol §4.2) are the targets this
+// mon-client holds without probing them every cycle — Exclusions.Derived —
+// with their material, so the diagnostic sweep can probe them without a
+// new revision (and an xray restart) per run: mon-client keeps them ready
+// and probes them only in a cycle a heartbeat answer asks it to. They are
+// part of the revision like everything else in the document; absent when
+// there are none, which is all an older mon-client ever sees of them.
 type ConfigDoc struct {
 	ConfigRevision string         `json:"configRevision"`
 	MonClientID    string         `json:"monClientId"`
 	ProbeURL       string         `json:"probeUrl"`
 	Probe          ProbeParams    `json:"probe"`
 	Targets        []ConfigTarget `json:"targets"`
+	SweepTargets   []ConfigTarget `json:"sweepTargets,omitempty"`
 }
 
 // TargetKey names one target without describing it. It is comparable (so it
@@ -293,6 +302,21 @@ type Exclusions struct {
 	// Inbounds maps an inbound (a TargetKey with an empty Path, the same
 	// shape protocols uses) to its enable flag in panel_inbounds.
 	Inbounds map[TargetKey]bool
+	// Hosts are the addresses a diagnostic sweep of this mon-client checks
+	// with ICMP (decision #100): each probed hop on a Monitored path by its
+	// name and host — the proxy front as "proxy" on a panel without a
+	// chain — and the real server as "" while direct is Monitored. Only
+	// addresses the mon-client's own probe material already names: a box
+	// kept off direct is not told the real server's address this way.
+	Hosts []SweepHost
+}
+
+// SweepHost is one address a diagnostic sweep checks (Exclusions.Hosts):
+// Name is the hop's name ("proxy" for the override's proxy front, "" for
+// the real server) and Host the address the panel renders it with.
+type SweepHost struct {
+	Name string
+	Host string
 }
 
 // Retired reports whether key's path is one the panel no longer serves — a
@@ -415,10 +439,31 @@ func (b *ConfigBuilder) Exclusions(ctx context.Context, monClientID string) (Exc
 			}
 		}
 	}
+	x.Hosts = sweepHosts(mat, x.Monitored)
 	for _, r := range rows {
 		x.Inbounds[TargetKey{InboundKind: r.InboundKind, InboundID: r.InboundId}] = r.Enable
 	}
 	return x, nil
+}
+
+// sweepHosts is Exclusions.Hosts: the hops of mat on a monitored path in
+// the chain's order (or the override's proxy front without a chain), then
+// the real server while direct is monitored.
+func sweepHosts(mat panel.Material, monitored map[string]bool) []SweepHost {
+	var out []SweepHost
+	if mat.Chained() {
+		for _, h := range mat.Chain.ProbedHops() {
+			if monitored[h.Path()] && h.Host != "" {
+				out = append(out, SweepHost{Name: h.Name, Host: h.Host})
+			}
+		}
+	} else if monitored[store.PathProxy] && mat.Override.Enabled && mat.Override.Host != "" {
+		out = append(out, SweepHost{Name: store.PathProxy, Host: mat.Override.Host})
+	}
+	if monitored[store.PathDirect] && mat.Host != "" {
+		out = append(out, SweepHost{Name: "", Host: mat.Host})
+	}
+	return out
 }
 
 // buildAndStore builds one document and upserts it into client_configs.
@@ -471,13 +516,15 @@ func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *stor
 		Targets: []ConfigTarget{},
 	}
 
-	for _, path := range ExpandPaths(pathsOf(mc), mat) {
+	steady := ExpandPaths(pathsOf(mc), mat)
+	targetsOf := func(path string) []ConfigTarget {
+		var out []ConfigTarget
 		for _, item := range mat.Items(path) {
 			if !itemFor(item, mc.Id) {
 				continue
 			}
 			key := TargetKey{InboundKind: item.Kind, InboundID: item.InboundId, Path: path}
-			doc.Targets = append(doc.Targets, ConfigTarget{
+			out = append(out, ConfigTarget{
 				InboundKind: item.Kind,
 				InboundID:   item.InboundId,
 				Path:        path,
@@ -489,18 +536,21 @@ func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *stor
 				Conf: item.Conf,
 			})
 		}
+		return out
+	}
+	for _, path := range steady {
+		doc.Targets = append(doc.Targets, targetsOf(path)...)
+	}
+	// The held paths (decision #100): monitored, not probed every cycle.
+	for _, path := range MonitoredPaths(pathsOf(mc), mat) {
+		if !slices.Contains(steady, path) {
+			doc.SweepTargets = append(doc.SweepTargets, targetsOf(path)...)
+		}
 	}
 	// A stable order is what makes the revision a function of content
 	// rather than of the order two paths happened to be iterated in.
-	slices.SortFunc(doc.Targets, func(x, y ConfigTarget) int {
-		if c := strings.Compare(x.InboundKind, y.InboundKind); c != 0 {
-			return c
-		}
-		if x.InboundID != y.InboundID {
-			return x.InboundID - y.InboundID
-		}
-		return strings.Compare(x.Path, y.Path)
-	})
+	slices.SortFunc(doc.Targets, compareTargets)
+	slices.SortFunc(doc.SweepTargets, compareTargets)
 
 	rev, err := revisionOf(doc)
 	if err != nil {
@@ -508,6 +558,17 @@ func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *stor
 	}
 	doc.ConfigRevision = rev
 	return doc, nil
+}
+
+// compareTargets orders a document's targets by kind, inbound and path.
+func compareTargets(x, y ConfigTarget) int {
+	if c := strings.Compare(x.InboundKind, y.InboundKind); c != 0 {
+		return c
+	}
+	if x.InboundID != y.InboundID {
+		return x.InboundID - y.InboundID
+	}
+	return strings.Compare(x.Path, y.Path)
 }
 
 // DefaultPaths is spec §5.1's default paths vocabulary, given at approval

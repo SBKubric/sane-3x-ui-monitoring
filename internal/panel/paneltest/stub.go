@@ -111,11 +111,17 @@ var (
 // Hop is one hop of the stub's chain registry — the panel's whole
 // registry, pending and draining hops included, of which GET /state reports
 // only the joined and legacy ones (contract 3 §4.1).
+//
+// Next and NextHopCheck are decision #100's optional fields: the hop's next
+// hop ("" for the real server) and its last check of it. Next is part of
+// the revision, NextHopCheck is not (SetNextHopCheck changes it in place).
 type Hop struct {
-	Name  string
-	Role  string
-	Host  string
-	State string
+	Name         string
+	Role         string
+	Host         string
+	State        string
+	Next         *string
+	NextHopCheck *panel.HopCheck
 }
 
 // RecordedRequest is one request the stub received, kept whether or not it
@@ -318,6 +324,19 @@ func (s *Stub) SetChain(activeEdge string, hops []Hop) {
 	s.chain = append([]Hop(nil), hops...)
 	s.activeEdge = activeEdge
 	s.chainRevision++
+}
+
+// SetNextHopCheck sets one hop's check of its next hop as GET /state
+// reports it (decision #100) — without moving the revision, which does
+// not cover it.
+func (s *Stub) SetNextHopCheck(name string, check *panel.HopCheck) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.chain {
+		if s.chain[i].Name == name {
+			s.chain[i].NextHopCheck = check
+		}
+	}
 }
 
 // AwgItem is one path's AWG item for one mon-client, the contract-2 shape
@@ -560,7 +579,14 @@ func (s *Stub) revisionLocked() string {
 	if chain := s.chainLocked(); chain != nil {
 		// Contract 3 §4.2: the active edge and the hops, not the registry's
 		// own revision counter.
-		doc["chain"] = map[string]any{"activeEdge": chain.ActiveEdge, "hops": chain.Hops}
+		// The hops' checks of their next hops are not covered (decision
+		// #100): they change on every chain poll.
+		hops := make([]panel.Hop, 0, len(chain.Hops))
+		for _, h := range chain.Hops {
+			h.NextHopCheck = nil
+			hops = append(hops, h)
+		}
+		doc["chain"] = map[string]any{"activeEdge": chain.ActiveEdge, "hops": hops}
 	}
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -582,7 +608,7 @@ func (s *Stub) chainLocked() *panel.Chain {
 		if h.State != panel.HopJoined && h.State != panel.HopLegacy {
 			continue
 		}
-		ph := panel.Hop{Name: h.Name, Role: h.Role, Host: h.Host, State: h.State}
+		ph := panel.Hop{Name: h.Name, Role: h.Role, Host: h.Host, State: h.State, Next: h.Next, NextHopCheck: h.NextHopCheck}
 		if h.Role == store.HopRoleInner {
 			inner = append(inner, ph)
 		} else {

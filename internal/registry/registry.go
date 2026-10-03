@@ -945,6 +945,9 @@ func (r *Registry) Delete(ctx context.Context, id string) error {
 		if err := tx.Where("mon_client_id = ?", id).Delete(&store.Target{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("mon_client_id = ?", id).Delete(&store.Sweep{}).Error; err != nil {
+			return err
+		}
 		return clearParkedToken(tx, id)
 	})
 }

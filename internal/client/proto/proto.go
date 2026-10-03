@@ -89,12 +89,17 @@ type ProbeParams struct {
 // ConfigDoc is the GET /v1/config document (protocol §4.2). Field names and
 // order mirror mon-server's internal/registry.ConfigDoc exactly, since both
 // are just views of the same bytes on the wire.
+//
+// SweepTargets (decision #100) are applied like Targets — parsed, given an
+// xray outbound or an AWG config — but probed only in a cycle that runs a
+// diagnostic sweep (SweepJob); absent from an older mon-server's document.
 type ConfigDoc struct {
 	ConfigRevision string      `json:"configRevision"`
 	MonClientID    string      `json:"monClientId"`
 	ProbeURL       string      `json:"probeUrl"`
 	Probe          ProbeParams `json:"probe"`
 	Targets        []Target    `json:"targets"`
+	SweepTargets   []Target    `json:"sweepTargets,omitempty"`
 }
 
 // RegisterRequest is the POST /v1/register body (protocol §2.1).
@@ -144,11 +149,37 @@ type Result struct {
 // §5.3, §6). Unverified marks a cycle whose heartbeat was never
 // acknowledged: it is resent for statistics only, since a live state
 // transition may never be replayed after the fact (protocol §5.3).
+//
+// Sweep is the diagnostic sweep run this cycle made because the heartbeat
+// answer before it asked for one (decision #100); nil otherwise.
 type Cycle struct {
-	Seq        int64    `json:"seq"`
-	Ts         int64    `json:"ts"`
-	Unverified bool     `json:"unverified"`
-	Results    []Result `json:"results"`
+	Seq        int64       `json:"seq"`
+	Ts         int64       `json:"ts"`
+	Unverified bool        `json:"unverified"`
+	Results    []Result    `json:"results"`
+	Sweep      *CycleSweep `json:"sweep,omitempty"`
+}
+
+// CycleSweep is one diagnostic sweep run as a cycle reports it (protocol
+// §5.3): the inbound kinds the job named, the tunnel probes of their sweep
+// targets and the host reachability checks of the job's hosts.
+type CycleSweep struct {
+	Kinds   []string    `json:"kinds"`
+	Results []Result    `json:"results"`
+	Hosts   []HostCheck `json:"hosts"`
+}
+
+// HostCheck is one host reachability check (protocol §5.3, CONTEXT.md:
+// Host reachability check): a series of ICMP echoes to the job's host
+// Name. Reason is set — ReasonICMPUnavailable, ReasonResolveFailed — when
+// the series could not be run at all; then nothing was measured, which is
+// not 100% loss. RttAvgMs is nil when no echo came back.
+type HostCheck struct {
+	Name     string  `json:"name"`
+	Sent     int     `json:"sent"`
+	LossPct  int     `json:"lossPct"`
+	RttAvgMs *int64  `json:"rttAvgMs"`
+	Reason   *string `json:"reason"`
 }
 
 // ClientInfo is mon-client's self-report on every heartbeat (protocol
@@ -189,10 +220,28 @@ type HeartbeatRequest struct {
 // HeartbeatResponse is the 200 body (protocol §5.3): the revision
 // mon-client should be converged on, mon-server's own receive time, and the
 // highest cycle seq it has taken responsibility for.
+//
+// Sweep asks for a diagnostic sweep run in the next cycle (decision #100);
+// absent when none is due, and from an older mon-server.
 type HeartbeatResponse struct {
-	ConfigRevision string `json:"configRevision"`
-	ServerTs       int64  `json:"serverTs"`
-	AckSeq         int64  `json:"ackSeq"`
+	ConfigRevision string    `json:"configRevision"`
+	ServerTs       int64     `json:"serverTs"`
+	AckSeq         int64     `json:"ackSeq"`
+	Sweep          *SweepJob `json:"sweep,omitempty"`
+}
+
+// SweepJob is one diagnostic sweep run (protocol §5.3): probe the sweep
+// targets of these inbound kinds, and check these hosts with ICMP — Name
+// "" is the real server, any other a hop.
+type SweepJob struct {
+	Kinds []string       `json:"kinds"`
+	Hosts []SweepJobHost `json:"hosts"`
+}
+
+// SweepJobHost is one host of a SweepJob.
+type SweepJobHost struct {
+	Name string `json:"name"`
+	Host string `json:"host"`
 }
 
 // ProbeEcho is the GET /v1/probe response body (protocol §5.2): mon-server
@@ -215,4 +264,14 @@ const (
 	ReasonAWGNoHandshake  = "awg_no_handshake"
 	ReasonHTTPError       = "http_error"
 	ReasonProbeTimeout    = "probe_timeout"
+)
+
+// Host reachability check reasons (protocol §5.3): the series could not be
+// run, as opposed to run and lost.
+const (
+	// ReasonICMPUnavailable: no unprivileged ICMP socket — the box's
+	// net.ipv4.ping_group_range does not include mon-client's group.
+	ReasonICMPUnavailable = "icmp_unavailable"
+	// ReasonResolveFailed: the host's name has no IPv4 address.
+	ReasonResolveFailed = "resolve_failed"
 )

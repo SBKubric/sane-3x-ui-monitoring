@@ -76,6 +76,10 @@ type Deps struct {
 	PanelDown func() bool
 	Configs   ConfigSource
 	Stats     StatsSink
+	// Chain is the chain of the panel's last GET /state
+	// (*panel.Poller.LatestChain), for the hops' checks of their next hops
+	// in a diagnostic sweep's report (decision #100). Nil reports none.
+	Chain func() *panel.Chain
 }
 
 // Engine is mon-server's whole opinion-forming machinery: it applies
@@ -92,6 +96,7 @@ type Engine struct {
 	panelDown func() bool
 	configs   ConfigSource
 	stats     StatsSink
+	chain     func() *panel.Chain
 }
 
 // New wires an Engine, filling in the harmless defaults (a Nop notifier, a
@@ -105,6 +110,7 @@ func New(d Deps) *Engine {
 		panelDown: d.PanelDown,
 		configs:   d.Configs,
 		stats:     d.Stats,
+		chain:     d.Chain,
 	}
 	if e.clk == nil {
 		e.clk = clock.Real{}
@@ -173,6 +179,7 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 	var (
 		ack    int64
 		notify notices
+		job    *SweepJob
 	)
 	err = e.st.DB.Transaction(func(tx *gorm.DB) error {
 		tx = tx.WithContext(ctx)
@@ -206,6 +213,15 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 			}
 			c.Ts = clampTs(c.Ts, nowMs)
 			c.Results = keepKnown(c.Results, keys)
+			if c.Sweep != nil {
+				// A sweep run's tunnel probes count only for the targets
+				// this mon-client holds without probing them every cycle
+				// (decision #100); they move no state machine and feed no
+				// statistics — applySweep alone reads them.
+				sweep := *c.Sweep
+				sweep.Results = keepKnown(sweep.Results, excl.Derived)
+				c.Sweep = &sweep
+			}
 			cycles = append(cycles, c)
 		}
 
@@ -226,10 +242,17 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 			return err
 		}
 
-		if live := liveCycle(cycles); live != nil {
+		live := liveCycle(cycles)
+		if live != nil {
 			if err := e.applyLive(tx, &notify, mc, *live, th, now); err != nil {
 				return err
 			}
+		}
+		// The sweep before derived state: a sweep that ends here hands its
+		// inner targets back to derived state in the same heartbeat.
+		var err error
+		if job, err = e.applySweep(tx, &notify, mc, live, excl, nowMs); err != nil {
+			return err
 		}
 		if err := e.applyDerived(tx, mc.Id, excl, nowMs); err != nil {
 			return err
@@ -257,6 +280,7 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 		ConfigRevision: e.revisionFor(ctx, mc.Id, hb.ConfigRevision),
 		ServerTs:       nowMs,
 		AckSeq:         ack,
+		Sweep:          job,
 	}, nil
 }
 

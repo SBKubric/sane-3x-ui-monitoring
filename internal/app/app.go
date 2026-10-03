@@ -248,6 +248,7 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		PanelDown: poller.PanelDown,
 		Configs:   configs,
 		Stats:     buckets,
+		Chain:     poller.LatestChain,
 	})
 	poller.SetInbounds(engine)
 	poller.SetPathSync(engine)

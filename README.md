@@ -156,6 +156,13 @@ docker run -d --name mon-client \
 Go still reads the system directory `/etc/ssl/certs` alongside that file, so public CAs keep working.
 A production mon-server (`tls.acmeCa=production`) needs none of this.
 
+During a diagnostic sweep (all edge paths of an inbound kind down) mon-client also checks the
+chain's hops and the real server with ICMP echoes. It needs no capability for that — it opens an
+unprivileged ICMP datagram socket — but the kernel only allows one to the groups in
+`net.ipv4.ping_group_range`. Docker 20.10 and later set that for every container; elsewhere set it
+(`--sysctl net.ipv4.ping_group_range="0 2147483647"`), or the sweep reports `icmp_unavailable`
+for every host instead of a loss figure.
+
 State — `state.json` (registration), `cycles.json` (unverified heartbeat buffer) and `xray.json`
 (generated xray config) — lives under `/var/lib/mon-client`, which the image declares as a
 `VOLUME` so it survives a container restart.
