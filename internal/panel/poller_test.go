@@ -1728,3 +1728,68 @@ func TestPoll_ChainAppearsAndGoes(t *testing.T) {
 		t.Fatalf("material after the chain went: chained=%v proxy=%v, want proxy items back", mat.Chained(), mat.Items(store.PathProxy))
 	}
 }
+
+// TestPoll_LatestChainCarriesNextHopChecks is decision #100's compatible
+// contract-3 change: the hops' checks of their next hops arrive in GET
+// /state on every poll and are kept as the latest chain, while — not being
+// part of the revision — they move no material and rebuild no config.
+func TestPoll_LatestChainCarriesNextHopChecks(t *testing.T) {
+	h := newHarness(t)
+	chainOf(h, "edge-a")
+	if h.poller.LatestChain() != nil {
+		t.Fatal("a latest chain before any poll")
+	}
+	if err := h.poller.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	c := h.poller.LatestChain()
+	if c == nil || len(c.ProbedHops()) != 3 || c.ProbedHops()[1].NextHopCheck != nil {
+		t.Fatalf("latest chain = %+v, want the three probed hops, no checks yet", c)
+	}
+	rebuilds := h.configs.calls()
+
+	rtt := int64(4)
+	h.stub.SetNextHopCheck("edge-a", &panel.HopCheck{At: 1757721530000, Sent: 10, LossPct: 20, RttAvgMs: &rtt})
+	if err := h.poller.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	var edgeA panel.Hop
+	for _, hop := range h.poller.LatestChain().ProbedHops() {
+		if hop.Name == "edge-a" {
+			edgeA = hop
+		}
+	}
+	if edgeA.NextHopCheck == nil || edgeA.NextHopCheck.LossPct != 20 || *edgeA.NextHopCheck.RttAvgMs != 4 {
+		t.Fatalf("edge-a = %+v, want its check of the next hop", edgeA)
+	}
+	if got := h.configs.calls(); got != rebuilds {
+		t.Fatalf("a next-hop check rebuilt the configs (%d → %d), want no material change", rebuilds, got)
+	}
+}
+
+// TestChain_NextName is the hop's next hop: the panel's own next when it
+// sends one, otherwise what the chain's order implies — inner hops from
+// the panel outwards, the edges outside the last of them, "" for the real
+// server.
+func TestChain_NextName(t *testing.T) {
+	bridge := "bridge"
+	c := &panel.Chain{Hops: []panel.Hop{
+		{Name: "core-1", Role: "inner", State: "joined"},
+		{Name: "core-2", Role: "inner", State: "joined"},
+		{Name: "edge-a", Role: "edge", State: "joined"},
+		{Name: "edge-b", Role: "edge", State: "joined", Next: &bridge},
+	}}
+	for name, want := range map[string]string{"core-1": "", "core-2": "core-1", "edge-a": "core-2", "edge-b": "bridge"} {
+		for _, h := range c.Hops {
+			if h.Name == name {
+				if got := c.NextName(h); got != want {
+					t.Errorf("NextName(%s) = %q, want %q", name, got, want)
+				}
+			}
+		}
+	}
+	flat := &panel.Chain{Hops: []panel.Hop{{Name: "edge-a", Role: "edge", State: "joined"}}}
+	if got := flat.NextName(flat.Hops[0]); got != "" {
+		t.Errorf("an edge with no inner hop: NextName = %q, want the real server", got)
+	}
+}

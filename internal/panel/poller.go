@@ -278,6 +278,11 @@ type Poller struct {
 
 	material     Material
 	haveMaterial bool
+	// chain is the chain of the last GET /state from a panel on the
+	// contract, read on every poll rather than with the material: the
+	// hops' nextHopCheck changes without moving the panel's revision
+	// (decision #100), and the diagnostic sweep reports it as it stands.
+	chain *Chain
 	// materialStale is RefreshMaterial's invalidation of the cached
 	// material (decision #51 §4): set when Settings changes realHost or
 	// panelUrl, cleared only when a fresh material has been accepted, so a
@@ -415,6 +420,17 @@ func (p *Poller) Material() (Material, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.material, p.haveMaterial
+}
+
+// LatestChain is the chain the last GET /state reported, nil before one or
+// on a panel without a chain. Unlike Material's, it is refreshed on every
+// poll, so the hops' host reachability checks of their next hops
+// (Hop.NextHopCheck, decision #100) are as fresh as the panel's. The value
+// is never written after it is stored, so a caller may read it freely.
+func (p *Poller) LatestChain() *Chain {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.chain
 }
 
 // Run drives the cycle every minute until ctx is cancelled, starting with
@@ -598,6 +614,7 @@ func (p *Poller) applyState(ctx context.Context, st *State, revision string) {
 	}
 	p.mu.Lock()
 	sync := p.inbounds
+	p.chain = st.Chain
 	p.mu.Unlock()
 	if sync == nil {
 		return
