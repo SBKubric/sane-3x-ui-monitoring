@@ -26,8 +26,9 @@ type Thresholds struct {
 	// FlapMin is the sliding window FlapN transitions are counted over
 	// (default 30 min).
 	FlapMin time.Duration
-	// FlapHoldMin is how long FLAPPING must go without a transition before
-	// the target drops back to its actual state (default 15 min).
+	// FlapHoldMin is how long FLAPPING must go without a change of probe
+	// outcome (ok<->fail) before the target drops back to its actual state
+	// (default 15 min).
 	FlapHoldMin time.Duration
 }
 
@@ -79,14 +80,12 @@ func OutcomeOf(r Result) Outcome {
 
 // Transition is one state change the machine decided on: what the panel's
 // event feed (contract §4.6) and, in PANEL_DOWN, Telegram will carry.
-// Silent marks the transitions spec §7.2 says are events only — the
-// UP<->DOWN flips inside FLAPPING, which must not each produce their own
-// Telegram message; that is the whole point of the FLAPPING state.
+// Every transition is a real one: the target's flips inside FLAPPING are
+// not transitions at all (see stepFlapping).
 type Transition struct {
 	From   string
 	To     string
 	Reason string
-	Silent bool
 	// SinceMs is when the From state began — Target.Since as it stood
 	// before this transition rewrote it. Spec §7.2's "UP" row needs it: the
 	// Telegram message for DOWN → UP has to carry how long the target was
@@ -114,31 +113,21 @@ func Step(cur store.Target, th Thresholds, res Outcome, now time.Time) (store.Ta
 	next := cur
 	var evs []Transition
 
-	// FLAPPING first: a hold that has run out ends before this result is
-	// applied, so the result lands in the state the target has actually
-	// returned to (spec §7.2: "flapHoldMin без переходов → фактическое
-	// состояние").
-	if next.State == store.TargetFlapping && next.FlappingUntil != nil && nowMs >= *next.FlappingUntil {
-		to := derivedState(cur, th)
-		reason := ReasonRecovered
-		if to == store.TargetDown {
-			reason = lastFailureReason(cur.Reason)
-		}
-		evs = append(evs, Transition{From: store.TargetFlapping, To: to, Reason: reason, SinceMs: cur.Since})
-		next.State = to
-		next.Since = nowMs
-		next.FlappingUntil = nil
-		// The window is cleared with the hold: it has just been served, and
-		// keeping the four old transitions would send the target straight
-		// back into FLAPPING on the very next flip, which would make the
-		// cooldown meaningless.
-		next.Transitions = "[]"
-		if to == store.TargetUp {
-			next.Reason = ""
-		} else {
-			next.Reason = reason
+	// FLAPPING first: a hold that ran out before this result means the
+	// target has already gone flapHoldMin without its probe outcome
+	// changing, so it leaves FLAPPING on the streak that served the hold,
+	// and this result lands in the state the target has actually returned
+	// to (spec §7.2: "flapHoldMin без смены исхода → фактическое состояние").
+	if next.State == store.TargetFlapping && holdServed(cur, nowMs) {
+		if to, ok := settledState(cur, th); ok {
+			evs = append(evs, leaveFlapping(&next, to, cur.Reason, nowMs))
 		}
 	}
+
+	// Whether this result changes the probe outcome (ok<->fail) is read
+	// off the counters before they move: after any result exactly one of
+	// them is non-zero and names the last outcome.
+	outcomeChanged := !lastOutcomeIs(cur, res.Ok)
 
 	next.LastResultAt = &nowMs
 	if res.Ok {
@@ -150,21 +139,9 @@ func Step(cur store.Target, th Thresholds, res Outcome, now time.Time) (store.Ta
 	}
 
 	if next.State == store.TargetFlapping {
-		// Inside FLAPPING the target keeps flipping underneath; the row
-		// stays FLAPPING (so the panel shows one unstable target rather
-		// than a stream of UP/DOWN) while each flip is still filed as an
-		// event, silently, and restarts the hold — the exit condition is
-		// "flapHoldMin without transitions".
-		from := derivedState(cur, th)
-		to := derivedState(next, th)
-		if from != to {
-			next.Transitions, _ = recordTransition(next.Transitions, nowMs, th.FlapMin)
-			until := nowMs + th.FlapHoldMin.Milliseconds()
-			next.FlappingUntil = &until
-			next.Reason = rowReason(res)
-			evs = append(evs, Transition{From: from, To: to, Reason: eventReason(res), Silent: true, SinceMs: next.Since})
-		}
-		return next, evs
+		// Still FLAPPING means the block above did not leave it, so there
+		// are no earlier events to keep.
+		return stepFlapping(next, th, res, outcomeChanged, nowMs)
 	}
 
 	want := next.State
@@ -206,27 +183,97 @@ func Step(cur store.Target, th Thresholds, res Outcome, now time.Time) (store.Ta
 	return next, append(evs, Transition{From: from, To: want, Reason: eventReason(res), SinceMs: fromSince})
 }
 
-// derivedState is what a FLAPPING target's counters say it really is — the
-// state it would show if FLAPPING were not masking it, needed both for the
-// flips filed while flapping and for the state it drops back to on exit.
-// It is total: after any result exactly one of the two counters is
-// non-zero, and a streak too short to cross its threshold means the target
-// is still in the state it was flipping away from.
-func derivedState(t store.Target, th Thresholds) string {
+// stepFlapping is one result applied to a target that is (still) FLAPPING,
+// with its counters already moved. The whole point of FLAPPING is that the
+// target keeps flipping underneath while the panel shows one unstable
+// target, so nothing inside it is published (issue #101): no UP/DOWN
+// events, silent or otherwise — the panel moves its row and sends Telegram
+// on every target event it gets with notified=false, so a "silent" flip
+// still reached the administrator as a false DOWN/UP. The only events a
+// FLAPPING target produces are entering it and leaving it.
+//
+// The hold restarts on every change of probe outcome (ok<->fail) — not on
+// UP<->DOWN flips guessed from a streak too short to cross a threshold,
+// which is what used to restart it. A hold that has run out ends the state as soon as the
+// current streak crosses its normal threshold (downAfter failures or
+// upAfter successes): until it does, the counters do not say what the
+// target actually is, and guessing would bring back the very false DOWN
+// after a single success this function exists to avoid.
+func stepFlapping(next store.Target, th Thresholds, res Outcome, outcomeChanged bool, nowMs int64) (store.Target, []Transition) {
+	// The row keeps the last failure's diagnosis while the streak is
+	// failing, so a hold served before the next result (Step's first
+	// block) can leave into DOWN with the reason that put it there.
+	next.Reason = rowReason(res)
+	if outcomeChanged {
+		until := nowMs + th.FlapHoldMin.Milliseconds()
+		next.FlappingUntil = &until
+		return next, nil
+	}
+	if holdServed(next, nowMs) {
+		if to, ok := settledState(next, th); ok {
+			ev := leaveFlapping(&next, to, next.Reason, nowMs)
+			return next, []Transition{ev}
+		}
+	}
+	return next, nil
+}
+
+// leaveFlapping moves t out of FLAPPING into to and returns the one event
+// that announces it. A DOWN exit carries the last failure's reason
+// (failReason, the row's reason while the failing streak lasted); an UP
+// exit carries recovered. DOWN never carries recovered: settledState only
+// answers DOWN for a failing streak.
+func leaveFlapping(t *store.Target, to, failReason string, nowMs int64) Transition {
+	reason := ReasonRecovered
+	if to == store.TargetDown {
+		reason = lastFailureReason(failReason)
+	}
+	ev := Transition{From: store.TargetFlapping, To: to, Reason: reason, SinceMs: t.Since}
+	t.State = to
+	t.Since = nowMs
+	t.FlappingUntil = nil
+	// The window is cleared with the hold: it has just been served, and
+	// keeping the four old transitions would send the target straight back
+	// into FLAPPING on the very next flip, which would make the cooldown
+	// meaningless.
+	t.Transitions = "[]"
+	if to == store.TargetUp {
+		t.Reason = ""
+	} else {
+		t.Reason = reason
+	}
+	return ev
+}
+
+// holdServed reports whether t's FLAPPING hold has run out by nowMs. A
+// FLAPPING row without a hold (which this package never writes) is treated
+// as still holding; its next outcome change arms one.
+func holdServed(t store.Target, nowMs int64) bool {
+	return t.FlappingUntil != nil && nowMs >= *t.FlappingUntil
+}
+
+// settledState is what a FLAPPING target's current streak says it actually
+// is, by the ordinary thresholds: DOWN after downAfter failures in a row,
+// UP after upAfter successes in a row. A streak still short of its
+// threshold settles nothing (ok=false) and the target stays FLAPPING.
+func settledState(t store.Target, th Thresholds) (string, bool) {
 	switch {
 	case t.ConsecutiveFail >= th.DownAfter:
-		return store.TargetDown
+		return store.TargetDown, true
 	case t.ConsecutiveOk >= th.UpAfter:
-		return store.TargetUp
-	case t.ConsecutiveFail > 0:
-		return store.TargetUp
-	case t.ConsecutiveOk > 0:
-		return store.TargetDown
+		return store.TargetUp, true
 	default:
-		// No results at all, which a FLAPPING target cannot reach — treat
-		// it as UP rather than inventing a failure nobody reported.
-		return store.TargetUp
+		return "", false
 	}
+}
+
+// lastOutcomeIs reports whether t's last result had outcome ok. A row with
+// no result at all has no last outcome, so any result counts as a change.
+func lastOutcomeIs(t store.Target, ok bool) bool {
+	if ok {
+		return t.ConsecutiveOk > 0
+	}
+	return t.ConsecutiveFail > 0
 }
 
 // isUpDown reports whether s is one of the two states whose flips feed the

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"math/rand"
 	"strconv"
 	"testing"
 	"time"
@@ -192,19 +193,19 @@ func TestStep_FlappingEntry(t *testing.T) {
 		t.Fatalf("got %d events, want %d (one per transition, the last one FLAPPING): %+v", len(evs), th.FlapN, evs)
 	}
 	last := evs[len(evs)-1]
-	if last.To != store.TargetFlapping || last.Reason != ReasonFlapping || last.Silent {
-		t.Fatalf("last event = %+v, want a loud transition into FLAPPING with reason flapping", last)
+	if last.To != store.TargetFlapping || last.Reason != ReasonFlapping {
+		t.Fatalf("last event = %+v, want a transition into FLAPPING with reason flapping", last)
 	}
 	if got.FlappingUntil == nil || *got.FlappingUntil != clock.Ms(minute(len(flapResults(th, th.FlapN))))+th.FlapHoldMin.Milliseconds() {
 		t.Fatalf("flapping_until = %v, want the last result's time + flapHoldMin", got.FlappingUntil)
 	}
 }
 
-// TestStep_FlappingSuppressesAlertsInside is the "подавление алертов
-// внутри" case: while FLAPPING, every flip is still an event (the panel's
-// feed stays complete) but is marked Silent so no Telegram goes out, and
-// the row stays FLAPPING.
-func TestStep_FlappingSuppressesAlertsInside(t *testing.T) {
+// TestStep_FlappingIsQuietInside is issue #101: while FLAPPING, the
+// target's flips underneath produce no events at all — not even "silent"
+// ones, which the panel would turn into a false DOWN/UP row and Telegram
+// message — and the row stays FLAPPING.
+func TestStep_FlappingIsQuietInside(t *testing.T) {
 	th := testThresholds()
 	entry := flapResults(th, th.FlapN)
 	inside := flapResults(th, 2)
@@ -213,23 +214,233 @@ func TestStep_FlappingSuppressesAlertsInside(t *testing.T) {
 	if got.State != store.TargetFlapping {
 		t.Fatalf("state = %s, want FLAPPING", got.State)
 	}
-	insideEvents := evs[th.FlapN:]
-	if len(insideEvents) != 2 {
-		t.Fatalf("inside events = %+v, want one per flip", insideEvents)
+	if insideEvents := evs[th.FlapN:]; len(insideEvents) != 0 {
+		t.Fatalf("inside events = %+v, want none", insideEvents)
 	}
-	for _, ev := range insideEvents {
-		if !ev.Silent {
-			t.Fatalf("event %+v inside FLAPPING is not Silent; it would alert", ev)
+}
+
+// enterFlapping drives a fresh UP target into FLAPPING and returns the row
+// and the time of its last result.
+func enterFlapping(t *testing.T, th Thresholds) (store.Target, time.Time) {
+	t.Helper()
+	results := flapResults(th, th.FlapN)
+	cur, _ := drive(target(store.TargetUp, 3, 0), th, results)
+	if cur.State != store.TargetFlapping {
+		t.Fatalf("setup: state = %s, want FLAPPING", cur.State)
+	}
+	return cur, minute(len(results))
+}
+
+// TestStep_FlappingAlternatingSingleResults is the production case behind
+// issue #101: single failures and single successes alternating every
+// minute used to read as UP→DOWN "recovered" and DOWN→UP flips. Each
+// result changes the probe outcome, so each restarts the hold, and none of
+// them is an event.
+func TestStep_FlappingAlternatingSingleResults(t *testing.T) {
+	th := testThresholds()
+	cur, at := enterFlapping(t, th)
+
+	for i := 0; i < 60; i++ {
+		at = at.Add(time.Minute)
+		r := ok()
+		if i%2 == 0 {
+			r = fail("awg_no_handshake")
 		}
-		if !isUpDown(ev.From) || !isUpDown(ev.To) {
-			t.Fatalf("event %+v inside FLAPPING should carry the real UP<->DOWN flip", ev)
+		var evs []Transition
+		cur, evs = Step(cur, th, r, at)
+		if len(evs) != 0 {
+			t.Fatalf("result %d (%+v) inside FLAPPING produced %+v, want nothing", i, r, evs)
+		}
+		if cur.State != store.TargetFlapping {
+			t.Fatalf("result %d: state = %s, want FLAPPING", i, cur.State)
+		}
+		if want := clock.Ms(at) + th.FlapHoldMin.Milliseconds(); *cur.FlappingUntil != want {
+			t.Fatalf("result %d: flapping_until = %d, want %d (restarted by the outcome change)", i, *cur.FlappingUntil, want)
 		}
 	}
 }
 
-// TestStep_FlappingExit checks the exit: flapHoldMin with no transition at
-// all drops the target back to what its counters actually say, with one
-// loud event.
+// settleAfterFlapping alternates single results inside FLAPPING, then
+// feeds the steady outcome r one per minute until the target leaves
+// FLAPPING, and returns every event of the steady part.
+func settleAfterFlapping(t *testing.T, th Thresholds, r Outcome) (store.Target, []Transition, time.Time) {
+	t.Helper()
+	cur, at := enterFlapping(t, th)
+	for i := 0; i < 6; i++ {
+		at = at.Add(time.Minute)
+		alt := ok()
+		if i%2 == 0 {
+			alt = fail("tls_timeout")
+		}
+		cur, _ = Step(cur, th, alt, at)
+	}
+	var all []Transition
+	for i := 0; i < 60 && cur.State == store.TargetFlapping; i++ {
+		at = at.Add(time.Minute)
+		var evs []Transition
+		cur, evs = Step(cur, th, r, at)
+		all = append(all, evs...)
+	}
+	return cur, all, at
+}
+
+// TestStep_FlappingExitsUpRecovered: a steady run of successes for
+// flapHoldMin ends FLAPPING with one FLAPPING → UP, reason recovered.
+func TestStep_FlappingExitsUpRecovered(t *testing.T) {
+	th := testThresholds()
+	got, evs, _ := settleAfterFlapping(t, th, ok())
+	if got.State != store.TargetUp {
+		t.Fatalf("state = %s, want UP", got.State)
+	}
+	if len(evs) != 1 || evs[0].From != store.TargetFlapping || evs[0].To != store.TargetUp || evs[0].Reason != ReasonRecovered {
+		t.Fatalf("events = %+v, want exactly one FLAPPING → UP (recovered)", evs)
+	}
+	if got.Reason != "" || got.FlappingUntil != nil || got.Transitions != "[]" {
+		t.Fatalf("row after exit = %+v, want empty reason, no hold, empty window", got)
+	}
+}
+
+// TestStep_FlappingExitsDownWithFailureReason: a steady run of failures
+// ends FLAPPING with one FLAPPING → DOWN carrying the failure's reason.
+func TestStep_FlappingExitsDownWithFailureReason(t *testing.T) {
+	th := testThresholds()
+	got, evs, _ := settleAfterFlapping(t, th, fail("awg_no_handshake"))
+	if got.State != store.TargetDown {
+		t.Fatalf("state = %s, want DOWN", got.State)
+	}
+	if len(evs) != 1 || evs[0].From != store.TargetFlapping || evs[0].To != store.TargetDown || evs[0].Reason != "awg_no_handshake" {
+		t.Fatalf("events = %+v, want exactly one FLAPPING → DOWN (awg_no_handshake)", evs)
+	}
+	if got.Reason != "awg_no_handshake" {
+		t.Fatalf("row reason = %q, want the failure's reason", got.Reason)
+	}
+}
+
+// TestStep_FlappingExitWaitsForThreshold: a hold that has run out does not
+// end FLAPPING on a streak too short to say what the target is (the old
+// code read one success after failures as DOWN and left with http_error).
+// The target leaves once the streak crosses its ordinary threshold.
+func TestStep_FlappingExitWaitsForThreshold(t *testing.T) {
+	th := testThresholds()
+	cur, at := enterFlapping(t, th)
+
+	// A failure (outcome change, hold restarts), then a single success,
+	// then silence well past the hold.
+	at = at.Add(time.Minute)
+	cur, _ = Step(cur, th, fail("tcp_timeout"), at)
+	at = at.Add(time.Minute)
+	cur, _ = Step(cur, th, ok(), at)
+	at = at.Add(2 * th.FlapHoldMin)
+
+	// The first result after the hold: cur's streak is one success, short
+	// of upAfter, so the hold settles nothing before this result; with it
+	// the streak reaches upAfter and the target leaves as UP.
+	next, evs := Step(cur, th, ok(), at)
+	if next.State != store.TargetUp || len(evs) != 1 || evs[0].To != store.TargetUp || evs[0].Reason != ReasonRecovered {
+		t.Fatalf("state %s, events %+v, want one FLAPPING → UP (recovered)", next.State, evs)
+	}
+
+	// The same row, but the first result after the hold is a failure: it
+	// changes the outcome, so the target stays FLAPPING with a fresh hold
+	// rather than leaving into anything.
+	next, evs = Step(cur, th, fail("tcp_timeout"), at)
+	if next.State != store.TargetFlapping || len(evs) != 0 {
+		t.Fatalf("state %s, events %+v, want FLAPPING and no events", next.State, evs)
+	}
+	if want := clock.Ms(at) + th.FlapHoldMin.Milliseconds(); *next.FlappingUntil != want {
+		t.Fatalf("flapping_until = %d, want %d", *next.FlappingUntil, want)
+	}
+}
+
+// TestStep_FlappingServedHoldExitsBeforeTheResult: a hold that ran out on
+// a settled streak ends FLAPPING before the arriving result is applied, so
+// a single opposite result does not re-arm it (spec §7.2: the result is
+// applied to the actual state).
+func TestStep_FlappingServedHoldExitsBeforeTheResult(t *testing.T) {
+	th := testThresholds()
+	cur, at := enterFlapping(t, th)
+	for i := 0; i < th.DownAfter; i++ {
+		at = at.Add(time.Minute)
+		cur, _ = Step(cur, th, fail("tcp_timeout"), at)
+	}
+	quiet := clock.FromMs(*cur.FlappingUntil).Add(time.Second)
+
+	next, evs := Step(cur, th, ok(), quiet)
+	if len(evs) != 1 || evs[0].From != store.TargetFlapping || evs[0].To != store.TargetDown || evs[0].Reason != "tcp_timeout" {
+		t.Fatalf("events = %+v, want one FLAPPING → DOWN (tcp_timeout), never recovered", evs)
+	}
+	if next.State != store.TargetDown || next.ConsecutiveOk != 1 {
+		t.Fatalf("row = %+v, want DOWN with the success counted towards upAfter", next)
+	}
+}
+
+// TestStep_NoDownIsEverRecovered runs long pseudo-random result sequences
+// with random gaps through the machine and checks the invariants of issue
+// #101 on every step: no DOWN carries recovered, and a target that was
+// FLAPPING before a result publishes nothing but its exit.
+func TestStep_NoDownIsEverRecovered(t *testing.T) {
+	th := testThresholds()
+	rng := rand.New(rand.NewSource(101))
+	reasons := []string{"tcp_timeout", "awg_no_handshake", "tls_timeout"}
+	entries, exitsUp, exitsDown := 0, 0, 0
+
+	for run := 0; run < 200; run++ {
+		cur := target(store.TargetUnknown, 0, 0)
+		at := baseTime
+		// The walk switches between coin flips and steady runs of either
+		// outcome, so targets both enter FLAPPING and leave it.
+		mode, left := 0, 0
+		for i := 0; i < 300; i++ {
+			if left == 0 {
+				mode, left = rng.Intn(3), 1+rng.Intn(25)
+			}
+			left--
+			gap := time.Minute
+			if rng.Intn(20) == 0 {
+				gap = time.Duration(1+rng.Intn(40)) * time.Minute
+			}
+			at = at.Add(gap)
+			failed := mode == 1 || (mode == 0 && rng.Intn(2) == 0)
+			r := ok()
+			if failed {
+				r = fail(reasons[rng.Intn(len(reasons))])
+			}
+
+			wasFlapping := cur.State == store.TargetFlapping
+			var evs []Transition
+			cur, evs = Step(cur, th, r, at)
+			for j, ev := range evs {
+				if ev.To == store.TargetDown && ev.Reason == ReasonRecovered {
+					t.Fatalf("run %d step %d: %+v is a DOWN with reason recovered", run, i, ev)
+				}
+				if wasFlapping && j == 0 && ev.From != store.TargetFlapping {
+					t.Fatalf("run %d step %d: FLAPPING target published %+v, want only its exit", run, i, ev)
+				}
+				switch {
+				case ev.To == store.TargetFlapping:
+					entries++
+				case ev.From == store.TargetFlapping && ev.To == store.TargetUp:
+					exitsUp++
+					if ev.Reason != ReasonRecovered {
+						t.Fatalf("run %d step %d: %+v, want recovered on an UP exit", run, i, ev)
+					}
+				case ev.From == store.TargetFlapping:
+					exitsDown++
+				}
+			}
+			if wasFlapping && len(evs) > 0 && cur.State == store.TargetFlapping {
+				t.Fatalf("run %d step %d: events %+v while staying FLAPPING", run, i, evs)
+			}
+		}
+	}
+	if entries == 0 || exitsUp == 0 || exitsDown == 0 {
+		t.Fatalf("walk covered %d entries, %d UP exits, %d DOWN exits; want all three non-zero", entries, exitsUp, exitsDown)
+	}
+}
+
+// TestStep_FlappingExit checks the exit: flapHoldMin with no change of
+// probe outcome drops the target back to what its counters actually say,
+// with one event.
 func TestStep_FlappingExit(t *testing.T) {
 	th := testThresholds()
 	// One flip past the entry, so the target is really DOWN underneath
@@ -244,8 +455,8 @@ func TestStep_FlappingExit(t *testing.T) {
 	if next.State != store.TargetDown {
 		t.Fatalf("state after the hold = %s, want DOWN", next.State)
 	}
-	if len(evs) != 1 || evs[0].From != store.TargetFlapping || evs[0].To != store.TargetDown || evs[0].Silent {
-		t.Fatalf("events = %+v, want one loud FLAPPING → DOWN", evs)
+	if len(evs) != 1 || evs[0].From != store.TargetFlapping || evs[0].To != store.TargetDown {
+		t.Fatalf("events = %+v, want one FLAPPING → DOWN", evs)
 	}
 	if evs[0].Reason != "tcp_timeout" {
 		t.Fatalf("exit reason = %q, want the last failure's reason", evs[0].Reason)
@@ -275,8 +486,9 @@ func TestStep_FlappingExitToUp(t *testing.T) {
 }
 
 // TestStep_FlappingHoldRestartsOnEveryFlip pins spec §7.2's exit condition
-// — flapHoldMin *without transitions*, not flapHoldMin after entering: a
-// target that keeps flipping stays FLAPPING however long that takes.
+// — flapHoldMin *without a change of probe outcome*, not flapHoldMin after
+// entering: a target that keeps flipping stays FLAPPING however long that
+// takes.
 func TestStep_FlappingHoldRestartsOnEveryFlip(t *testing.T) {
 	th := testThresholds()
 	cur, _ := drive(target(store.TargetUp, 3, 0), th, flapResults(th, th.FlapN))
