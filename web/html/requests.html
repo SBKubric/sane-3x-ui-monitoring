@@ -77,6 +77,7 @@
         <label>Paths this mon-client probes</label>
         <div>
           <a-checkbox v-model:checked="modal.paths.direct" data-testid="approve-path-direct">direct</a-checkbox>
+          <a-checkbox v-model:checked="modal.paths.edges" data-testid="approve-path-edges">edges</a-checkbox>
           <a-checkbox v-model:checked="modal.paths.hops" data-testid="approve-path-hops">hops</a-checkbox>
         </div>
         <div v-if="!modal.paths.hops" data-testid="approve-path-hop-list">

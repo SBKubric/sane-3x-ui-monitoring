@@ -154,10 +154,10 @@ type State struct {
 // it never recomputes it, so this is purely mon-server reporting what it
 // believes, and a full snapshot replaces the panel's cache on every ensure.
 //
-// Paths is the mon-client's paths vocabulary as stored (contract 3, spec
-// §5.1: direct, hops, explicit hops): the panel expands it by its probed
-// path set and keeps an AWG probe peer only for the pairs the mon-client
-// really probes.
+// Paths is the paths vocabulary of every path the mon-client holds
+// targets on (contract 3, spec §5.1: direct, hops, explicit hops — a stored
+// edges is sent as direct and hops, decision #100): the panel expands it by
+// its probed path set and keeps an AWG probe peer only for those pairs.
 type MonClientSnapshot struct {
 	Id            string   `json:"id"`
 	Name          string   `json:"name"`

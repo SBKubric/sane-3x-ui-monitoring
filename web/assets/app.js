@@ -98,24 +98,27 @@ window.mon = (function () {
   }
 
   /* The paths picker of the Approve and Edit modals (spec §9.2, §9.3)
-   * edits a paths vocabulary (spec §5.1) as {direct, hops, named}: the two
-   * checkboxes, and — only while hops is unchecked — the hops chosen by
-   * name. picker turns a stored list into that state, pickedPaths back into
-   * the list the API takes (hops covers every named hop, so they are
-   * dropped with it), and hopOptions lists what can be named: the probed
-   * hops of the last GET /state plus any stored name the chain no longer
-   * probes, so an Edit never drops one the administrator did not touch. */
+   * edits a paths vocabulary (spec §5.1) as {direct, edges, hops, named}:
+   * the three checkboxes, and — only while hops is unchecked — the hops
+   * chosen by name. picker turns a stored list into that state (none stored
+   * is the default, edges — decision #100), pickedPaths back into the list
+   * the API takes (hops covers every named hop, so they are dropped with
+   * it), and hopOptions lists what can be named: the probed hops of the
+   * last GET /state plus any stored name the chain no longer probes, so an
+   * Edit never drops one the administrator did not touch. */
   function picker(paths) {
-    paths = paths || ['direct', 'hops'];
+    paths = paths || ['edges'];
     return {
       direct: paths.indexOf('direct') >= 0,
+      edges: paths.indexOf('edges') >= 0,
       hops: paths.indexOf('hops') >= 0,
-      named: paths.filter(function (p) { return p !== 'direct' && p !== 'hops'; })
+      named: paths.filter(function (p) { return p !== 'direct' && p !== 'edges' && p !== 'hops'; })
     };
   }
   function pickedPaths(p) {
     var out = [];
     if (p.direct) { out.push('direct'); }
+    if (p.edges) { out.push('edges'); }
     if (p.hops) { out.push('hops'); } else { out = out.concat(p.named); }
     return out;
   }
