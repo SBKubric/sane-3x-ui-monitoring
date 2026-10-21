@@ -53,7 +53,7 @@ _Avoid_: agent, probe node, sensor
 _Avoid_: check, monitor, endpoint
 
 **Path**:
-Через какой адрес target достигает real server: `direct` (настоящий адрес real server), `edge:<name>` или `inner:<name>` (конкретное звено цепочки по имени) либо, только на панели без цепочки, `proxy` (адрес proxy front из host override). В `paths` mon-client'а, кроме `direct` и конкретных звеньев, допустим `hops` — все пробируемые звенья цепочки, включая будущие (на панели без цепочки — `proxy`).
+Через какой адрес target достигает real server: `direct` (настоящий адрес real server), `edge:<name>` или `inner:<name>` (конкретное звено цепочки по имени) либо, только на панели без цепочки, `proxy` (адрес proxy front из host override). В `paths` mon-client'а, кроме `direct` и конкретных звеньев, допустим `hops` — все пробируемые звенья цепочки, включая будущие (на панели без цепочки — `proxy`), и `edges` — все edge front'ы цепочки, включая будущие; остальные path тогда проверяются только в diagnostic sweep.
 _Avoid_: mode, route
 
 **Probe account**:
@@ -63,6 +63,18 @@ _Avoid_: monitoring client, service user, test client
 **Tunnel probe**:
 Ежеминутный запрос mon-client к mon-server, отправленный внутрь туннеля target'а; его успех означает, что inbound работает для реальных клиентов по этому path.
 _Avoid_: ping, healthcheck
+
+**Host reachability check** (ICMP-проверка узла):
+ICMP-эхо до адреса звена или real server — с mon-client до каждого из них и от каждого звена до следующего по цепочке. Проверяет только достижимость адреса, а не работу inbound'а; живёт только внутри diagnostic sweep.
+_Avoid_: ping, healthcheck, reachability probe
+
+**Diagnostic sweep** (обход):
+Проверка всех path и host reachability checks по цепочке для одного типа inbound'ов (AWG или xray) у одного mon-client'а, когда ни один его edge-path не в UP (все DOWN или FLAPPING): показывает, до какого звена трафик ещё доходит. Повторяется с растущим интервалом, пока хоть один edge-path этого типа не вернётся в UP; сообщает одним сводным уведомлением при входе, при каждом изменении картины и при выходе.
+_Avoid_: full probe, fallback probing, scan
+
+**Derived state** (выведенное состояние):
+Состояние target'а с path `inner:<name>`, которое не проверяется в обычном режиме, а выводится из edge-path'ов того же типа inbound'а: UP, пока хоть один из них UP, потому что edge-path проходит через это звено. Во время diagnostic sweep его заменяет результат обхода. Target с path `direct` derived state не имеет: вне обхода он показывает результат последнего обхода, потому что `direct` — отдельный сетевой путь.
+_Avoid_: implied state, assumed UP
 
 **Heartbeat**:
 Ежеминутный запрос mon-client к mon-server мимо туннеля; несёт результаты tunnel probes и диагностику, а в ответ получает номер актуальной ревизии конфига. Отсутствие heartbeat означает, что мёртв сам mon-client, а не туннель.
