@@ -114,13 +114,18 @@ func OpenBuffer(path string) (*Buffer, error) {
 // of its own and the loop does — and because a caller that wanted to stop
 // on a state directory it cannot write should be able to.
 func (b *Buffer) Add(ts int64, results []proto.Result) (proto.Cycle, error) {
+	return b.AddCycle(ts, results, nil)
+}
+
+// AddCycle is Add for a cycle that may also carry a diagnostic sweep run
+// (decision #100, protocol §5.3), buffered and resent with it like the
+// rest of the cycle.
+func (b *Buffer) AddCycle(ts int64, results []proto.Result, sweep *proto.CycleSweep) (proto.Cycle, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	c := proto.Cycle{Seq: b.nextSeq, Ts: ts, Results: results}
+	c := proto.Cycle{Seq: b.nextSeq, Ts: ts, Results: results, Sweep: sweep}
 	if c.Results == nil {
-		// Protocol §5.3's results is a list; a cycle with no targets sends
-		// [], not null (spec §4.4).
 		c.Results = []proto.Result{}
 	}
 	b.nextSeq++

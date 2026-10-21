@@ -85,6 +85,8 @@ type Stub struct {
 	// goes below it, and cycles at or below it are the duplicates
 	// mon-server drops (spec §7.1 step 3).
 	lastAck map[string]int64
+	// sweep is the diagnostic sweep job the next heartbeat answer carries.
+	sweep *proto.SweepJob
 
 	// tunnel probe (protocol §5.2)
 	probeNonceOverride *string
@@ -437,6 +439,14 @@ func (s *Stub) handleConfig(w http.ResponseWriter, r *http.Request) {
 // SetLastAckSeq programs mon-server's remembered last_ack_seq for one
 // mon-client — a box that lost its cycles.json and state.json behind a
 // mon-server that still remembers the seqs it acknowledged.
+// SetSweep makes the next heartbeat answer ask for a diagnostic sweep run
+// (decision #100); only that one answer carries it.
+func (s *Stub) SetSweep(job *proto.SweepJob) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweep = job
+}
+
 func (s *Stub) SetLastAckSeq(monClientID string, seq int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -486,12 +496,15 @@ func (s *Stub) handleHeartbeat(w http.ResponseWriter, r *http.Request, body []by
 	s.lastAck[monClientID] = ackSeq
 	s.heartbeats = append(s.heartbeats, hb)
 	rev := s.revision
+	sweep := s.sweep
+	s.sweep = nil
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, proto.HeartbeatResponse{
 		ConfigRevision: rev,
 		ServerTs:       time.Now().UnixMilli(),
 		AckSeq:         ackSeq,
+		Sweep:          sweep,
 	})
 }
 

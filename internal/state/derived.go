@@ -60,7 +60,7 @@ func (e *Engine) applyDerived(tx *gorm.DB, monClientID string, excl registry.Exc
 		if t.State == store.TargetUp || t.State == store.TargetPaused {
 			continue
 		}
-		if err := e.moveQuiet(tx, t, store.TargetUp, ReasonDerived, nowMs); err != nil {
+		if err := e.moveQuiet(tx, t, store.TargetUp, ReasonDerived, "", nowMs); err != nil {
 			return err
 		}
 	}
@@ -70,16 +70,14 @@ func (e *Engine) applyDerived(tx *gorm.DB, monClientID string, excl registry.Exc
 // moveQuiet moves one target to a state that was not decided by its own
 // probe results — derived state, and the diagnostic sweep's verdict — and
 // files the event with notified = true: the panel records it, nobody sends
-// Telegram for it (decision #100). The streak counters and the FLAPPING
+// Telegram for it (decision #100). The row keeps rowReason — a DOWN
+// target's diagnosis, nothing for UP. The streak counters and the FLAPPING
 // hold restart with it, as for every move the machine did not make itself.
-func (e *Engine) moveQuiet(tx *gorm.DB, t store.Target, to, reason string, nowMs int64) error {
+func (e *Engine) moveQuiet(tx *gorm.DB, t store.Target, to, reason, rowReason string, nowMs int64) error {
 	from := t.State
 	t.State = to
 	t.Since = nowMs
-	t.Reason = reason
-	if to == store.TargetUp {
-		t.Reason = ""
-	}
+	t.Reason = rowReason
 	t.ConsecutiveOk = 0
 	t.ConsecutiveFail = 0
 	t.FlappingUntil = nil

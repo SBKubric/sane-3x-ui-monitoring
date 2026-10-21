@@ -52,6 +52,7 @@ func models() []any {
 		&EventOutbox{},
 		&StatsBucket{},
 		&ProbeSeen{},
+		&Sweep{},
 	}
 }
 
