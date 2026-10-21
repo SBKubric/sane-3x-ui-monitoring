@@ -231,6 +231,9 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 				return err
 			}
 		}
+		if err := e.applyDerived(tx, mc.Id, excl, nowMs); err != nil {
+			return err
+		}
 
 		if e.stats != nil && len(cycles) > 0 {
 			// A failing sink rolls the heartbeat back rather than being
@@ -737,7 +740,9 @@ func (e *Engine) retirePaused(tx *gorm.DB, monClientID string, keys map[registry
 // its config for a reason other than its inbound goes PAUSED with that
 // reason (override_disabled, path_removed, no_probe_link) — the row and its
 // history are kept — and one PAUSED for such a reason that is back in the
-// config goes UNKNOWN (config_enabled), so the next result decides. A
+// config, or is now one the mon-client holds without probing it every
+// cycle (excl.Derived, decision #100), goes UNKNOWN (config_enabled), so
+// the next result or derived state decides. A
 // target out of the config because its inbound is disabled or gone gets no
 // reason here; SyncInbounds pauses it (config_disabled) and releases it.
 //
@@ -806,7 +811,7 @@ func (e *Engine) reconcilePauses(tx *gorm.DB, monClientID string, keys, rejected
 		switch {
 		case reason != "" && t.State != store.TargetPaused:
 			err = e.moveRows(tx, []store.Target{t}, store.TargetPaused, reason, nowMs)
-		case reason == "" && t.State == store.TargetPaused && configPauseReasons[t.Reason] && keys[key]:
+		case reason == "" && t.State == store.TargetPaused && configPauseReasons[t.Reason] && (keys[key] || excl.Derived[key]):
 			err = e.moveRows(tx, []store.Target{t}, store.TargetUnknown, ReasonConfigEnabled, nowMs)
 		}
 		if err != nil {

@@ -112,7 +112,7 @@ var (
 	// §5.1 — direct, hops, edge:<name>, inner:<name> — handler: 400
 	// invalid_body. Never reachable from /v1/register* (that surface never
 	// validates paths), only from the admin API (step 10).
-	ErrInvalidPath = errors.New("registry: paths are \"direct\", \"hops\", \"edge:<name>\" or \"inner:<name>\"")
+	ErrInvalidPath = errors.New("registry: paths are \"direct\", \"edges\", \"hops\", \"edge:<name>\" or \"inner:<name>\"")
 	// ErrRequestNotPending means Approve/ApproveAsReplacement/Reject was
 	// called on a request that is not (or no longer) pending — an admin UI
 	// bug (double-click, stale page), not a mon-client-facing error.
@@ -501,7 +501,7 @@ func (r *Registry) ExpireRequests(ctx context.Context) (int, error) {
 
 // ApproveInput is what an administrator supplies when approving a pending
 // request (spec §9.2's Approve modal). Paths is the paths vocabulary of
-// spec §5.1 and defaults to ["direct","hops"] when empty.
+// spec §5.1 and defaults to ["edges"] when empty (decision #100).
 type ApproveInput struct {
 	Name   string
 	Region string
@@ -509,7 +509,7 @@ type ApproveInput struct {
 }
 
 // validatePaths checks paths against the paths vocabulary of spec §5.1 —
-// direct, hops, or a hop by name (edge:<name>, inner:<name>) — applying the
+// direct, edges, hops, or a hop by name (edge:<name>, inner:<name>) — applying the
 // default when paths is empty, and returns a defensive copy without
 // repeats so the caller can't mutate what gets stored after the fact.
 // proxy is refused: it left the vocabulary for hops (decision #61 п. 3).
@@ -521,7 +521,7 @@ func validatePaths(paths []string) ([]string, error) {
 	}
 	out := make([]string, 0, len(paths))
 	for _, p := range paths {
-		if p != store.PathDirect && p != store.PathHops && !store.IsHopPath(p) {
+		if p != store.PathDirect && p != store.PathHops && p != store.PathEdges && !store.IsHopPath(p) {
 			return nil, fmt.Errorf("%w: %q", ErrInvalidPath, p)
 		}
 		if !slices.Contains(out, p) {

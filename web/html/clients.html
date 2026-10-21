@@ -42,7 +42,7 @@
           <span v-if="c.lastHeartbeat">[[ ago(c.lastHeartbeat, now) ]]</span>
           <span class="muted" v-else>approved [[ ago(c.approvedAt, now) ]]</span>
         </td>
-        <td data-testid="client-paths"><a-tag v-for="p in c.paths" :key="p" :color="p === 'hops' ? 'blue' : 'default'" data-testid="client-path">[[ p ]]</a-tag></td>
+        <td data-testid="client-paths"><a-tag v-for="p in c.paths" :key="p" :color="p === 'hops' || p === 'edges' ? 'blue' : 'default'" data-testid="client-path">[[ p ]]</a-tag></td>
         <td data-testid="client-version">
           <span v-if="c.version">v[[ c.version ]] <span class="muted">· xray [[ c.xrayVersion || '?' ]]</span></span>
           <span class="muted" v-else>—</span>
@@ -81,6 +81,7 @@
       <label>Paths</label>
       <div>
         <a-checkbox v-model:checked="edit.paths.direct" data-testid="edit-path-direct">direct</a-checkbox>
+        <a-checkbox v-model:checked="edit.paths.edges" data-testid="edit-path-edges">edges</a-checkbox>
         <a-checkbox v-model:checked="edit.paths.hops" data-testid="edit-path-hops">hops</a-checkbox>
       </div>
       <div v-if="!edit.paths.hops" data-testid="edit-path-hop-list">

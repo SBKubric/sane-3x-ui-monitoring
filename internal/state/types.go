@@ -143,6 +143,11 @@ const (
 	// target's current state, from = to, because the panel said it holds
 	// none for it.
 	ReasonResync = "resync"
+
+	// ReasonDerived marks a move of an inner:* target to its derived state
+	// (CONTEXT.md: Derived state, decision #100): UP because an edge-path
+	// of the same inbound kind is UP. Always notified, never Telegram.
+	ReasonDerived = "derived"
 )
 
 // configPauseReasons are the PAUSED reasons a heartbeat owns: it sets them

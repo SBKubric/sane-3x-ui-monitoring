@@ -13,6 +13,15 @@ import (
 // snapshot, never on a target: a target's path is always one hop.
 const PathHops = "hops"
 
+// PathEdges is the paths-vocabulary word for "every edge front of the
+// chain, active and standby, including edges that join later" (spec §5.1,
+// decision #100) — on a panel without a chain it stands for proxy, like
+// hops. It is the default: a mon-client on edges probes only its edge
+// paths every cycle, and the rest of the chain is kept for the diagnostic
+// sweep (CONTEXT.md: Derived state, Diagnostic sweep). Like hops it lives
+// in MonClient.Paths only, never on a target.
+const PathEdges = "edges"
+
 // Hop roles (CONTEXT.md: edge front, inner front), the prefix of a hop's
 // path.
 const (
@@ -38,6 +47,18 @@ func IsHopPath(p string) bool {
 		return false
 	}
 	return (role == HopRoleEdge || role == HopRoleInner) && ValidHopName(name)
+}
+
+// IsEdgePath reports whether p is an edge-path: edge:<name>, or proxy —
+// the one path to the proxy front on a panel without a chain. These are the
+// paths a mon-client on edges probes every cycle (decision #100).
+func IsEdgePath(p string) bool {
+	return p == PathProxy || (IsHopPath(p) && strings.HasPrefix(p, HopRoleEdge+":"))
+}
+
+// IsInnerPath reports whether p is inner:<name>.
+func IsInnerPath(p string) bool {
+	return IsHopPath(p) && strings.HasPrefix(p, HopRoleInner+":")
 }
 
 // ValidPath is the path grammar of spec §5.1 (protocol §4.2, contract §3):

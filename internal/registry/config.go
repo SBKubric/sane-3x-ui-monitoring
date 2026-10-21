@@ -272,9 +272,22 @@ type Exclusions struct {
 	Known bool
 	// Served is the panel's probed path set (panel.Material.Served).
 	Served map[string]bool
-	// Paths are the paths this mon-client probes: its paths vocabulary
-	// (spec §5.1's default applied) expanded by the material (ExpandPaths).
+	// Paths are the paths this mon-client probes every cycle: its paths
+	// vocabulary (spec §5.1's default applied) expanded by the material
+	// (ExpandPaths).
 	Paths map[string]bool
+	// Monitored are the paths this mon-client holds targets on
+	// (MonitoredPaths): Paths, plus — for a mon-client on edges — direct and
+	// every hop of the chain, whose targets are not probed every cycle but
+	// kept for the diagnostic sweep (decision #100).
+	Monitored map[string]bool
+	// Derived are this mon-client's targets on a Monitored path outside
+	// Paths that the panel gave it probe material for (an AWG one only
+	// with its own item, like the document's): targets it holds without
+	// probing them every cycle. An inner one shows derived state, direct the
+	// last sweep's result (CONTEXT.md: Derived state). They are neither in
+	// the document nor PAUSED.
+	Derived map[TargetKey]bool
 	// Override is whether the panel's host override is on.
 	Override bool
 	// Inbounds maps an inbound (a TargetKey with an empty Path, the same
@@ -305,7 +318,9 @@ func (x Exclusions) Reason(key TargetKey) string {
 		return ""
 	}
 	switch {
-	case !x.Paths[key.Path]:
+	case x.Derived[key]:
+		return ""
+	case !x.Paths[key.Path] && !x.Monitored[key.Path]:
 		return PausePathRemoved
 	case key.Path == store.PathProxy && !x.Override:
 		return PauseOverrideDisabled
@@ -315,9 +330,10 @@ func (x Exclusions) Reason(key TargetKey) string {
 }
 
 // Expected lists the targets of one inbound kind this mon-client should be
-// probing by the panel's own state, with or without an item in its
+// holding by the panel's own state, with or without an item in its
 // document: every enabled inbound of that kind crossed with the paths the
-// mon-client probes, proxy only while the override is on. The state engine asks it for
+// mon-client holds targets on (Paths and Monitored), proxy only while the
+// override is on. The state engine asks it for
 // AWG (decision #80 п. 10): a mon-client the panel gave no AWG probe peer
 // (pool exhausted, or not ensured yet) never probes that target and so
 // never creates its row, and without a row there is no PAUSED no_probe_link
@@ -326,12 +342,19 @@ func (x Exclusions) Expected(kind string) []TargetKey {
 	if !x.Known {
 		return nil
 	}
+	paths := make(map[string]bool, len(x.Paths)+len(x.Monitored))
+	for p := range x.Paths {
+		paths[p] = true
+	}
+	for p := range x.Monitored {
+		paths[p] = true
+	}
 	var out []TargetKey
 	for in, enabled := range x.Inbounds {
 		if !enabled || in.InboundKind != kind {
 			continue
 		}
-		for path := range x.Paths {
+		for path := range paths {
 			if path == store.PathProxy && !x.Override {
 				continue
 			}
@@ -367,17 +390,30 @@ func (b *ConfigBuilder) Exclusions(ctx context.Context, monClientID string) (Exc
 		return Exclusions{}, fmt.Errorf("registry: read panel_inbounds: %w", err)
 	}
 	x := Exclusions{
-		Known:    true,
-		Served:   map[string]bool{},
-		Paths:    map[string]bool{},
-		Override: mat.Override.Enabled,
-		Inbounds: make(map[TargetKey]bool, len(rows)),
+		Known:     true,
+		Served:    map[string]bool{},
+		Paths:     map[string]bool{},
+		Monitored: map[string]bool{},
+		Derived:   map[TargetKey]bool{},
+		Override:  mat.Override.Enabled,
+		Inbounds:  make(map[TargetKey]bool, len(rows)),
 	}
 	for _, p := range mat.Served() {
 		x.Served[p] = true
 	}
 	for _, p := range ExpandPaths(pathsOf(mc), mat) {
 		x.Paths[p] = true
+	}
+	for _, p := range MonitoredPaths(pathsOf(mc), mat) {
+		x.Monitored[p] = true
+		if x.Paths[p] {
+			continue
+		}
+		for _, item := range mat.Items(p) {
+			if itemFor(item, mc.Id) {
+				x.Derived[TargetKey{InboundKind: item.Kind, InboundID: item.InboundId, Path: p}] = true
+			}
+		}
 	}
 	for _, r := range rows {
 		x.Inbounds[TargetKey{InboundKind: r.InboundKind, InboundID: r.InboundId}] = r.Enable
@@ -476,8 +512,10 @@ func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *stor
 
 // DefaultPaths is spec §5.1's default paths vocabulary, given at approval
 // (admin UI and ansible's auto-approval alike) and to a mon-client with
-// none stored: direct and every probed hop.
-func DefaultPaths() []string { return []string{store.PathDirect, store.PathHops} }
+// none stored: edges — every edge front probed every cycle, the rest of the
+// chain kept for the diagnostic sweep (decision #100). A mon-client stored
+// with an explicit vocabulary keeps it.
+func DefaultPaths() []string { return []string{store.PathEdges} }
 
 // PathsOf is a mon-client's paths vocabulary with the default applied to a
 // row that has none (or an unreadable column), so no caller has to decide
@@ -494,12 +532,14 @@ func PathsOf(mc *store.MonClient) []string {
 func pathsOf(mc *store.MonClient) []string { return PathsOf(mc) }
 
 // ExpandPaths turns a paths vocabulary into the paths a mon-client probes
-// on the panel mat describes (spec §5.1): direct is direct; hops is every
-// probed hop of the chain, including hops that joined after the mon-client
-// was approved — or proxy on a panel without one; a hop by name is that
-// hop while the panel probes it, and nothing otherwise. A path reached
-// twice (hops and a name) is one path. The order is the vocabulary's, then
-// the chain's; the document sorts its targets anyway.
+// every cycle on the panel mat describes (spec §5.1): direct is direct;
+// hops is every probed hop of the chain, including hops that joined after
+// the mon-client was approved — or proxy on a panel without one; edges is
+// every probed edge of the chain, active and standby, likewise including
+// later ones — or proxy on a panel without one (decision #100); a hop by
+// name is that hop while the panel probes it, and nothing otherwise. A
+// path reached twice (hops and a name) is one path. The order is the
+// vocabulary's, then the chain's; the document sorts its targets anyway.
 func ExpandPaths(vocab []string, mat panel.Material) []string {
 	served := make(map[string]bool)
 	for _, p := range mat.Served() {
@@ -520,7 +560,13 @@ func ExpandPaths(vocab []string, mat panel.Material) []string {
 			for _, p := range mat.HopPaths() {
 				add(p)
 			}
-		case v == store.PathHops:
+		case v == store.PathEdges && chained:
+			for _, h := range mat.Chain.ProbedHops() {
+				if h.Role == store.HopRoleEdge {
+					add(h.Path())
+				}
+			}
+		case v == store.PathHops || v == store.PathEdges:
 			add(store.PathProxy)
 		case chained && store.IsHopPath(v) && served[v]:
 			add(v)
@@ -530,6 +576,42 @@ func ExpandPaths(vocab []string, mat panel.Material) []string {
 		// refused — expands into nothing.
 	}
 	return out
+}
+
+// MonitoredVocab is the paths vocabulary of every path a mon-client holds
+// targets on: the vocabulary itself, with edges standing for the whole
+// chain — direct and every hop (decision #100: probe accounts and AWG
+// probe peers are kept for every path of the chain, so a diagnostic sweep
+// has them). A vocabulary without edges is its own: it is probed in full
+// every cycle. The ensure snapshot carries this (spec §4 step 2), in the
+// words the panel expands: it knows direct, hops and names, not edges.
+func MonitoredVocab(vocab []string) []string {
+	if !slices.Contains(vocab, store.PathEdges) {
+		return slices.Clone(vocab)
+	}
+	out := make([]string, 0, len(vocab)+1)
+	add := func(p string) {
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	for _, v := range vocab {
+		if v == store.PathEdges {
+			add(store.PathDirect)
+			add(store.PathHops)
+			continue
+		}
+		add(v)
+	}
+	return out
+}
+
+// MonitoredPaths are the paths a mon-client holds targets on, on the panel
+// mat describes: ExpandPaths of MonitoredVocab. They include every path
+// ExpandPaths gives; the ones it does not are probed only in a diagnostic
+// sweep.
+func MonitoredPaths(vocab []string, mat panel.Material) []string {
+	return ExpandPaths(MonitoredVocab(vocab), mat)
 }
 
 // itemFor reports whether item belongs in monClientID's document (decision
@@ -670,7 +752,10 @@ func (s snapshotSource) Snapshot(ctx context.Context) ([]panel.MonClientSnapshot
 			Region:        mc.Region,
 			State:         mc.State,
 			LastHeartbeat: last,
-			Paths:         pathsOf(&mc),
+			// Every path the mon-client holds targets on, not only the
+			// ones it probes every cycle: the panel keeps AWG probe peers
+			// for exactly these (decision #100).
+			Paths: MonitoredVocab(pathsOf(&mc)),
 		})
 	}
 	return out, nil
