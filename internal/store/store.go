@@ -138,7 +138,8 @@ func ensurePrivateDir(dir string) error {
 }
 
 // Migrate brings the schema up to date with every model this step declares,
-// then runs the data migrations that go with it (migrateProxyPaths). It is
+// then runs the data migrations that go with it (migrateProxyPaths,
+// migrateBudgetDefault). It is
 // idempotent: gorm's AutoMigrate only adds what is missing and a data
 // migration finds nothing left to rewrite the second time, so calling
 // Migrate again on an already-current database is a fast no-op, which is
@@ -149,5 +150,8 @@ func (s *Store) Migrate() error {
 			return fmt.Errorf("store: migrate %T: %w", m, err)
 		}
 	}
-	return s.migrateProxyPaths()
+	if err := s.migrateProxyPaths(); err != nil {
+		return err
+	}
+	return s.migrateBudgetDefault()
 }

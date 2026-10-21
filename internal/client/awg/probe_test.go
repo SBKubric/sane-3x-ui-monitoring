@@ -50,12 +50,14 @@ Endpoint = %s
 // TestProbeNoHandshake is the reason dictionary's awg_no_handshake (spec
 // §5): a peer that never answers — here an address in the TEST-NET-3
 // documentation range, which nothing routes — leaves last_handshake_time at
-// zero, and the probe must say so instead of hanging for its whole budget.
+// zero, and the probe must say so. It says so at the end of the probe's
+// budget, not after connectMs (#102): a handshake that lands anywhere
+// inside the budget would still have counted.
 func TestProbeNoHandshake(t *testing.T) {
 	t.Parallel()
 
 	cfg := confFor(t, "203.0.113.7:51820", "")
-	b := probe.Budgets{Budget: 5 * time.Second, Connect: 400 * time.Millisecond, TLS: time.Second, Headers: time.Second}
+	b := probe.Budgets{Budget: 2 * time.Second, Connect: 400 * time.Millisecond, TLS: time.Second, Headers: time.Second}
 
 	start := time.Now()
 	res := Prober{Log: silent()}.Probe(context.Background(), "https://203.0.113.7:8443/v1/probe", "tok", proto.TargetKey{InboundKind: "awg", InboundID: 0, Path: "proxy"}, cfg, b)
@@ -70,11 +72,14 @@ func TestProbeNoHandshake(t *testing.T) {
 	if res.HandshakeMs != nil {
 		t.Errorf("handshakeMs = %d, want null when no handshake happened", *res.HandshakeMs)
 	}
-	if d := deref(res.Detail); d == "" {
-		t.Error("detail is empty; a failed probe must say why")
+	if d := deref(res.Detail); !strings.HasPrefix(d, "last_handshake_time=0 after ") || !strings.Contains(d, "1 handshake attempt") {
+		t.Errorf("detail = %q, want the wait and the number of handshake attempts", d)
 	}
-	if elapsed > 3*time.Second {
-		t.Errorf("probe took %s, want it to give up shortly after connectMs (400ms)", elapsed)
+	if elapsed < b.Budget-100*time.Millisecond {
+		t.Errorf("probe gave up after %s, want it to wait out the %s budget, not connectMs (%s)", elapsed, b.Budget, b.Connect)
+	}
+	if elapsed > b.Budget+2*time.Second {
+		t.Errorf("probe took %s, want it to give up shortly after the %s budget", elapsed, b.Budget)
 	}
 	if res.TargetKey.String() != "awg:0:proxy" {
 		t.Errorf("target key = %q", res.TargetKey.String())

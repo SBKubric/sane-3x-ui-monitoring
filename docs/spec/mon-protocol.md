@@ -62,7 +62,7 @@ GET /v1/register/<requestId>
   "configRevision": "3a91c0de77b1f2e4",
   "monClientId": "ams-1",
   "probeUrl": "https://203.0.113.10:443/v1/probe",
-  "probe": {"intervalMs": 60000, "budgetMs": 20000, "connectMs": 5000, "tlsMs": 10000, "headersMs": 10000, "startJitterMs": 5000, "heartbeatTimeoutMs": 10000},
+  "probe": {"intervalMs": 60000, "budgetMs": 30000, "connectMs": 5000, "tlsMs": 10000, "headersMs": 10000, "startJitterMs": 5000, "heartbeatTimeoutMs": 10000},
   "targets": [
     {"inboundKind": "xray", "inboundId": 12, "path": "edge:ams-1",   "protocol": "vless", "link": "vless://…@198.51.100.20:443?security=reality&…#probe-12"},
     {"inboundKind": "xray", "inboundId": 12, "path": "inner:core-1", "protocol": "vless", "link": "vless://…@198.51.100.7:443?security=reality&…#probe-12"},
@@ -75,7 +75,7 @@ GET /v1/register/<requestId>
 - mon-server собирает `targets` как `items` из `GET /probe/configs?host=<real>` (path `direct`) и `GET /probe/configs?hop=<name>` на каждое пробируемое звено цепочки (path `edge:<name>` / `inner:<name>`; на панели без цепочки — `GET /probe/configs`, path `proxy`, только при `override.enabled`) × `paths` этого mon-client (словарь `direct` | `hops` | явные звенья, default `[direct, hops]`; для коробок во враждебных регионах владелец снимает `direct`, чтобы не светить настоящий адрес real server как Reality-endpoint) — [mon-server.md](mon-server.md) §5.1, решение [#61](https://github.com/SBKubric/3ax-ui-monitoring/issues/61). Все inbound'ы — всем mon-clients; фильтра по inbound'ам в v1 нет. xray-ссылки общие, а AWG `.conf` у каждого mon-client свой (решение [#80](https://github.com/SBKubric/3ax-ui-monitoring/issues/80)): панель держит AWG probe-пир на mon-client × path, который этот mon-client пробирует (`paths` едут в снимке ensure), и mon-client получает только свой; wire-форма target'а от этого не меняется. Нет своего пира — нет AWG-target'а в конфиге (у mon-server он `PAUSED no_probe_link`).
 - **Грамматика `path`**: `direct` | `proxy` | `edge:<name>` | `inner:<name>`, `<name>` — имя звена цепочки (`[a-z0-9-]{1,32}`); `proxy` приходит только от панели без цепочки. Поведение mon-client от path не зависит: он только проверяет грамматику и возвращает path в результатах и ключах target'а (§5.2, §5.3). Кроме допустимых значений path, протокол не меняется и остаётся v1; дизайн mon-client тоже (решение [#61](https://github.com/SBKubric/3ax-ui-monitoring/issues/61) п. 8).
 - `link`/`conf` отдаются **как есть**: mon-server прозрачен, знание протоколов (ссылка → xray-outbound, .conf → netstack-устройство) живёт только в mon-client. Выключенных inbound'ов в `targets` нет — mon-server сам держит их как `PAUSED`.
-- `probe`-параметры — из research: цикл 60 с, бюджет пробы 20 с, connect 5 с, TLS 10 с, заголовки 10 с, джиттер старта 0–5 с, heartbeat 10 с. Настраиваются в admin UI глобально; пороги state machine (3/2/4-за-30/15) mon-client не нужны и в конфиг не входят.
+- `probe`-параметры — из research, бюджет поднят до 30 с ([#102](https://github.com/SBKubric/3ax-ui-monitoring/issues/102)): цикл 60 с, бюджет пробы 30 с (AWG ждёт handshake до его конца; connect у AWG считается от handshake), connect 5 с, TLS 10 с, заголовки 10 с, джиттер старта 0–5 с, heartbeat 10 с. Настраиваются в admin UI глобально; пороги state machine (3/2/4-за-30/15) mon-client не нужны и в конфиг не входят.
 
 ### 4.3 Применение
 
@@ -88,7 +88,7 @@ GET /v1/register/<requestId>
 
 ### 5.1 Цикл
 
-Раз в 60 с (по `intervalMs`, старт со случайным джиттером): все targets параллельно, каждая проба — `GET probeUrl` через свой туннель с бюджетом 20 с; затем один heartbeat с результатами цикла. Успех пробы определяет **mon-client**: `200` + совпавший `nonce` в бюджете.
+Раз в 60 с (по `intervalMs`, старт со случайным джиттером): все targets параллельно, каждая проба — `GET probeUrl` через свой туннель с бюджетом 30 с; затем один heartbeat с результатами цикла. Успех пробы определяет **mon-client**: `200` + совпавший `nonce` в бюджете.
 
 ### 5.2 Tunnel probe (через туннель)
 
@@ -116,7 +116,7 @@ POST /v1/heartbeat
        "connectMs": 3, "tlsMs": 47, "ttfbMs": 39, "handshakeMs": null, "egressIp": "203.0.113.10", "reason": null, "detail": null},
       {"inboundKind": "awg", "inboundId": 0, "path": "edge:ams-1", "ok": false,
        "connectMs": null, "tlsMs": null, "ttfbMs": null, "handshakeMs": null, "egressIp": null,
-       "reason": "awg_no_handshake", "detail": "last_handshake_time=0 after 20000ms"}
+       "reason": "awg_no_handshake", "detail": "last_handshake_time=0 after 30000ms, 6 handshake attempts"}
     ]}
   ]
 }

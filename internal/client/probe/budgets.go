@@ -19,13 +19,14 @@ import (
 )
 
 // Spec §5 defaults: the probe parameters mon-client falls back to when the
-// config document leaves one at zero. They are the research §5 recommendation
-// (a 60 s cycle has to fit a full-timeout probe plus the heartbeat) and are
-// duplicated on mon-server's side in store.DefaultSettings, so a mon-client
-// that never got a document still probes with the same timings as one that
-// did.
+// config document leaves one at zero. A 60 s cycle has to fit a full-budget
+// probe plus the heartbeat (30 s + 10 s); the budget is 30 s rather than the
+// research §5 20 s so that an AWG probe can sit out a few WireGuard
+// handshake retries, ~5 s apart (#102). They are duplicated on mon-server's
+// side in store.DefaultSettings, so a mon-client that never got a document
+// still probes with the same timings as one that did.
 const (
-	DefaultBudget  = 20 * time.Second
+	DefaultBudget  = 30 * time.Second
 	DefaultConnect = 5 * time.Second
 	DefaultTLS     = 10 * time.Second
 	DefaultHeaders = 10 * time.Second
@@ -40,8 +41,9 @@ type Budgets struct {
 	// the request. Exceeding it with no phase-specific error is probe_timeout.
 	Budget time.Duration
 	// Connect is net.Dialer.Timeout: for xray the dial is to loopback, so it
-	// really bounds the socks handshake; for AWG (step 6) it bounds the
-	// WireGuard handshake plus the TCP connect through the tunnel.
+	// really bounds the socks handshake; for AWG it bounds only the TCP
+	// connect through the tunnel, counted from the WireGuard handshake —
+	// the handshake itself may take the whole Budget (#102).
 	Connect time.Duration
 	// TLS is Transport.TLSHandshakeTimeout. For an xray probe this is the
 	// first end-to-end phase (Reality handshake + real server → mon-server TCP

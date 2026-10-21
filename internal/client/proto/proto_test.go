@@ -79,7 +79,7 @@ func TestHeartbeatRequest_MarshalsToProtocolShape(t *testing.T) {
 						HandshakeMs: nil,
 						EgressIp:    nil,
 						Reason:      strPtr("awg_no_handshake"),
-						Detail:      strPtr("last_handshake_time=0 after 20000ms"),
+						Detail:      strPtr("last_handshake_time=0 after 30000ms, 6 handshake attempts"),
 					},
 				},
 			},
@@ -100,7 +100,7 @@ func TestHeartbeatRequest_MarshalsToProtocolShape(t *testing.T) {
        "connectMs": 3, "tlsMs": 47, "ttfbMs": 39, "handshakeMs": null, "egressIp": "203.0.113.10", "reason": null, "detail": null},
       {"inboundKind": "awg", "inboundId": 0, "path": "proxy", "ok": false,
        "connectMs": null, "tlsMs": null, "ttfbMs": null, "handshakeMs": null, "egressIp": null,
-       "reason": "awg_no_handshake", "detail": "last_handshake_time=0 after 20000ms"}
+       "reason": "awg_no_handshake", "detail": "last_handshake_time=0 after 30000ms, 6 handshake attempts"}
     ]}
   ]
 }`

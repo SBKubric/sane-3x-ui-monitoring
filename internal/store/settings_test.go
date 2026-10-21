@@ -120,3 +120,76 @@ func TestSaveSettings_Upserts(t *testing.T) {
 		t.Fatalf("row count for %s = %d, want 1 (upsert, not duplicate)", settingDownAfter, count)
 	}
 }
+
+// TestMigrate_BudgetDefault is #102: the probe budget's default went from
+// 20 s to 30 s, and since Save writes every setting, an install that ever
+// saved the form has the old default stored. Migrate rewrites a stored
+// "20000" once; an administrator's own value is kept, and so is a 20 s
+// budget set on purpose after the migration ran.
+func TestMigrate_BudgetDefault(t *testing.T) {
+	t.Run("old default is rewritten", func(t *testing.T) {
+		s := openTestStore(t)
+		// openTestStore already migrated an empty table; drop the marker
+		// to stand in for a database from before #102.
+		if err := s.DB.Where("key = ?", settingBudgetDefaultMigrated).Delete(&Setting{}).Error; err != nil {
+			t.Fatalf("drop marker: %v", err)
+		}
+		set := DefaultSettings()
+		set.BudgetMs = 20000
+		if err := s.SaveSettings(set); err != nil {
+			t.Fatalf("SaveSettings: %v", err)
+		}
+		if err := s.Migrate(); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		if got := loadBudget(t, s); got != 30000 {
+			t.Errorf("budgetMs = %d, want 30000", got)
+		}
+
+		// A 20 s budget chosen after the migration survives a restart.
+		set.BudgetMs = 20000
+		if err := s.SaveSettings(set); err != nil {
+			t.Fatalf("SaveSettings: %v", err)
+		}
+		if err := s.Migrate(); err != nil {
+			t.Fatalf("Migrate again: %v", err)
+		}
+		if got := loadBudget(t, s); got != 20000 {
+			t.Errorf("budgetMs = %d after a second Migrate, want the administrator's 20000 kept", got)
+		}
+	})
+
+	t.Run("administrator's value is kept", func(t *testing.T) {
+		s := openTestStore(t)
+		if err := s.DB.Where("key = ?", settingBudgetDefaultMigrated).Delete(&Setting{}).Error; err != nil {
+			t.Fatalf("drop marker: %v", err)
+		}
+		set := DefaultSettings()
+		set.BudgetMs = 25000
+		if err := s.SaveSettings(set); err != nil {
+			t.Fatalf("SaveSettings: %v", err)
+		}
+		if err := s.Migrate(); err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		if got := loadBudget(t, s); got != 25000 {
+			t.Errorf("budgetMs = %d, want 25000 kept", got)
+		}
+	})
+
+	t.Run("fresh install gets the new default", func(t *testing.T) {
+		s := openTestStore(t)
+		if got := loadBudget(t, s); got != 30000 {
+			t.Errorf("budgetMs = %d, want 30000", got)
+		}
+	})
+}
+
+func loadBudget(t *testing.T, s *Store) int64 {
+	t.Helper()
+	got, err := s.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	return got.BudgetMs
+}

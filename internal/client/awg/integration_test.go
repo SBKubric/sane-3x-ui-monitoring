@@ -72,7 +72,7 @@ func TestIntegrationNetstackHandshake(t *testing.T) {
 
 	probeURL := fmt.Sprintf("https://%s:8443/v1/probe", serverTunnelIP)
 	key := proto.TargetKey{InboundKind: "awg", InboundID: 0, Path: "proxy"}
-	b := probe.Budgets{Budget: 20 * time.Second, Connect: 5 * time.Second, TLS: 5 * time.Second, Headers: 5 * time.Second}
+	b := probe.Budgets{Budget: 10 * time.Second, Connect: 5 * time.Second, TLS: 5 * time.Second, Headers: 5 * time.Second}
 
 	t.Run("right peer key completes a handshake", func(t *testing.T) {
 		cfg := clientConf(t, clientPriv, serverPub, endpoint)
@@ -84,8 +84,8 @@ func TestIntegrationNetstackHandshake(t *testing.T) {
 			t.Fatalf("handshakeMs is null: the netstack device never completed a handshake (%q: %q)",
 				deref(res.Reason), deref(res.Detail))
 		}
-		if *res.HandshakeMs < 0 || *res.HandshakeMs > b.Connect.Milliseconds() {
-			t.Errorf("handshakeMs = %d, want 0..%d", *res.HandshakeMs, b.Connect.Milliseconds())
+		if *res.HandshakeMs < 0 || *res.HandshakeMs > b.Budget.Milliseconds() {
+			t.Errorf("handshakeMs = %d, want 0..%d", *res.HandshakeMs, b.Budget.Milliseconds())
 		}
 		// The probe target is the server's own tunnel address and
 		// nothing listens there, so the failure must be the RST the
