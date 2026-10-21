@@ -1060,8 +1060,8 @@ func (e *Engine) emitTarget(tx *gorm.DB, notify *notices, mc *store.MonClient, t
 //
 // A target that went through FLAPPING therefore reports the length of its
 // last uninterrupted DOWN spell, not of the whole unstable period: leaving
-// FLAPPING restarts Since, and the UP<->DOWN flips inside FLAPPING are
-// Silent and never reach Telegram at all. That is the honest reading of
+// FLAPPING restarts Since, and a FLAPPING target produces no UP/DOWN
+// transitions at all (stepFlapping). That is the honest reading of
 // "длительность простоя" for a flapping target — the alternative, dating
 // the outage from the first failure of a target that has been up half the
 // time since, would overstate it.
@@ -1077,14 +1077,14 @@ func (e *Engine) telegramText(mc *store.MonClient, t store.Target, tr Transition
 		mc.Name, mc.Region, t.InboundKind, t.InboundId, t.Path, tr.From, tr.To, tr.Reason), true
 }
 
-// telegramWorthy applies spec §7.2's two exclusions: mon-server never
-// announces a transition into or out of UNKNOWN/PAUSED (they are bookkeeping,
-// not outages), and never announces the flips that happen inside FLAPPING
-// (Transition.Silent) — one message on entering and one on leaving is the
-// whole promise of that state. Everything else is announced only while the
-// panel cannot do it itself (spec §4.1).
+// telegramWorthy applies spec §7.2's exclusion: mon-server never announces
+// a transition into or out of UNKNOWN/PAUSED (they are bookkeeping, not
+// outages). The flips inside FLAPPING need no exclusion here: the machine
+// does not produce them (one event on entering and one on leaving is the
+// whole promise of that state). Everything else is announced only while
+// the panel cannot do it itself (spec §4.1).
 func (e *Engine) telegramWorthy(tr Transition) bool {
-	if tr.Silent || !e.panelDown() {
+	if !e.panelDown() {
 		return false
 	}
 	return isUpDown(tr.From) || isUpDown(tr.To) || tr.From == store.TargetFlapping || tr.To == store.TargetFlapping
